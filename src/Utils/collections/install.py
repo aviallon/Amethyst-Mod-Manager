@@ -41,9 +41,10 @@ from Utils.downloads.resources import InstallResources
 from Utils.downloads.scheduler import order_by_size, run_pipelined
 from Utils.downloads.speed import RollingDownloadSpeed
 from Utils.archives.budget import ExtractionMemoryBudget, probe_archive
+from Utils.fs.clone import clone_tree_hardlinked
 from Utils.mods.install import (
     install_collection_archive, FOMOD_DEFERRED, BAIN_DEFERRED,
-    _extract_archive, _link_or_copy)
+    _extract_archive)
 from Utils.mods.modlist import read_modlist, write_modlist, ModEntry
 from Utils.plugins import (
     read_plugins, read_loadorder, write_plugins, write_loadorder, PluginEntry,
@@ -3347,9 +3348,10 @@ def _install_bundled_assets(game, api, profile_dir, staging_path, collection_sch
                     dest = staging_path / mod_name_clean
                     if dest.exists():
                         _shutil.rmtree(dest)
-                    _shutil.copytree(
-                        str(bundle_subdir), str(dest),
-                        copy_function=_link_or_copy, symlinks=True)
+                    # Not shutil.copytree: preserve a bundled asset's symlinks
+                    # instead of following them, and never copy directory xattrs
+                    # (bcachefs.casefold -> ENOTEMPTY aborts the install).
+                    clone_tree_hardlinked(bundle_subdir, dest)
                     cp = _cpi.ConfigParser()
                     general = {
                         "modname": bm_name, "installationfile": file_expr,
@@ -3605,9 +3607,9 @@ def _install_bundled_from_extracted(archive_root, modlist_path, staging_path,
         if dest.exists():
             _shutil.rmtree(dest, ignore_errors=True)
         try:
-            _shutil.copytree(
-                str(src_folder), str(dest), copy_function=_link_or_copy,
-                symlinks=True)
+            # Not shutil.copytree: preserve symlinks, never copy directory xattrs
+            # (bcachefs.casefold -> ENOTEMPTY aborts the install).
+            clone_tree_hardlinked(src_folder, dest)
         except Exception:
             _shutil.rmtree(dest, ignore_errors=True)
             raise
