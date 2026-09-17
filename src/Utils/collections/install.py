@@ -3719,6 +3719,9 @@ def _install_bundled_assets(game, api, profile_dir, staging_path, collection_sch
                     if dest.exists():
                         raise FileExistsError(dest)
                     created = True
+                    # Not shutil.copytree: preserve a bundled asset's symlinks
+                    # instead of following them, and never copy directory xattrs
+                    # (bcachefs.casefold -> ENOTEMPTY aborts the install).
                     clone_tree_hardlinked(bundle_subdir, dest)
                     cp = _cpi.ConfigParser()
                     general = {
@@ -3993,6 +3996,8 @@ def _install_bundled_from_extracted(archive_root, modlist_path, staging_path,
         if dest.exists():
             _shutil.rmtree(dest, ignore_errors=True)
         try:
+            # Not shutil.copytree: preserve symlinks, never copy directory xattrs
+            # (bcachefs.casefold -> ENOTEMPTY aborts the install).
             clone_tree_hardlinked(src_folder, dest)
         except Exception:
             _shutil.rmtree(dest, ignore_errors=True)

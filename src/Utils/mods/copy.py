@@ -86,6 +86,13 @@ def copy_mod_to_profile(src_staging: Path, src_profile_dir: Path,
         return None
     try:
         dest_folder.parent.mkdir(parents=True, exist_ok=True)
+        # Use the shared walker, not shutil.copytree: it preserves a mod's Wine
+        # prefix symlinks (pfx/dosdevices/z: -> /) instead of following them
+        # into the whole host filesystem, and it never copies directory xattrs
+        # (bcachefs.casefold -> ENOTEMPTY aborts the clone). link_files=False
+        # keeps this call site's previous full-copy semantics: a profile copy
+        # must be independent of the source, so it does not hardlink bulk assets
+        # the way profile conversion does.
         clone_tree_hardlinked(src_folder, dest_folder, link_files=False)
     except Exception:
         if dest_folder.is_dir() and not dest_folder.is_symlink():

@@ -37,7 +37,16 @@ _COPY_EXTS = frozenset({
 
 
 def _clone_tree(src: Path, dst: Path) -> None:
-    """Clone a mod without traversing symlinks or copying directory xattrs."""
+    """Clone a mod folder into a profile: hardlink bulk assets, real-copy files
+    that may later be rewritten in place (see _COPY_EXTS), and PRESERVE symlinks.
+
+    Deliberately not ``shutil.copytree`` - see :mod:`Utils.fs.clone` for both
+    hazards it gets wrong (following a Wine prefix's ``dosdevices/z: -> /`` and
+    copying the internal ``bcachefs.casefold`` xattr, whose ``ENOTEMPTY`` abort
+    is reported by copytree as a clone failure). A failed clone propagates:
+    the caller treats it as FATAL and rolls back, because a partially cloned
+    profile would silently lose mods.
+    """
     clone_tree_hardlinked(src, dst, copy_exts=_COPY_EXTS)
 
 
