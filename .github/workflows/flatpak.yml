@@ -1,0 +1,199 @@
+name: Flatpak (viallon channel)
+
+# Internal release tags only:  v<upstream-version>[-<prerelease>]-viallon<N>
+#
+#   v2.4.3-viallon1         -> stable   (a stable publish also lands on beta)
+#   v2.5.0-beta.6-viallon1  -> beta
+#   v2.5.0-rc1-viallon2     -> beta
+#
+# NOTE: upstream classifies with `[[ "$ref" == v*-* ]] -> beta`, which would
+# mis-file `v2.4.3-viallon1` as beta. The classifier below strips the `-viallonN`
+# suffix FIRST and only then looks for a remaining prerelease.
+#
+# The build runs here; publishing is delegated to the reusable workflow in
+# aviallon/hub-viallon, which merges the result into the accumulated OSTree repo
+# served from that repository's Pages branch.
+
+on:
+  push:
+    tags:
+      - 'v*-viallon*'
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Ref to build.
+        required: true
+        default: viallon/release
+      channel:
+        description: OSTree channel to publish to.
+        type: choice
+        options:
+          - stable
+          - beta
+        default: beta
+      dry_run:
+        description: Publish to the dry-run Pages branch instead of the live one.
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  meta:
+    name: Resolve channel
+    runs-on: ubuntu-latest
+    outputs:
+      ostree: ${{ steps.c.outputs.ostree }}
+      subject: ${{ steps.c.outputs.subject }}
+      dry: ${{ steps.c.outputs.dry }}
+    steps:
+      - name: Classify the tag
+        id: c
+        shell: bash
+        env:
+          EVENT: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          IN_CHANNEL: ${{ inputs.channel }}
+          IN_DRY: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            echo "ostree=$IN_CHANNEL" >> "$GITHUB_OUTPUT"
+            echo "subject=$REF_NAME"   >> "$GITHUB_OUTPUT"
+            echo "dry=$IN_DRY"         >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          tag="$REF_NAME"
+
+          if [[ "$tag" != *-viallon* ]]; then
+            echo "::error::tag '$tag' must end in -viallon<N>"
+            exit 1
+          fi
+
+          n="${tag##*-viallon}"
+          if [[ ! "$n" =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error::viallon counter must be >= 1, got '$n' in '$tag'"
+            exit 1
+          fi
+
+          base="${tag%-viallon*}"
+
+          if   [[ "$base" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            ch=stable
+          elif [[ "$base" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-.+$ ]]; then
+            ch=beta
+          else
+            echo "::error::unrecognised base version '$base' (from '$tag')"
+            exit 1
+          fi
+
+          echo "ostree=$ch"                    >> "$GITHUB_OUTPUT"
+          echo "subject=${base#v}+viallon${n}" >> "$GITHUB_OUTPUT"
+          echo "dry=false"                     >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### Flatpak publish"
+            echo
+            echo "| field | value |"
+            echo "|---|---|"
+            echo "| tag | \`$tag\` |"
+            echo "| base version | \`$base\` |"
+            echo "| viallon release | \`$n\` |"
+            echo "| channel | **$ch** |"
+            echo "| commit subject | \`${base#v}+viallon${n}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  filegraph:
+    name: Build filegraph extension
+    needs: meta
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/cache@v4
+        with:
+          path: native/amethyst_filegraph/target/release
+          key: filegraph-release-v1-${{ runner.os }}-${{ hashFiles('native/amethyst_filegraph/Cargo.lock') }}
+          restore-keys: filegraph-release-v1-${{ runner.os }}-
+
+      # meson's src/meson.build installs src/amethyst_filegraph.abi3.so and
+      # fails outright if it is absent, so it must exist before flatpak-builder
+      # runs. Upstream does exactly this in its own filegraph-native job.
+      - name: Build the extension into src/
+        run: |
+          set -euo pipefail
+          cargo build --locked --release \
+            --manifest-path native/amethyst_filegraph/Cargo.toml
+          cp native/amethyst_filegraph/target/release/libamethyst_filegraph.so \
+             src/amethyst_filegraph.abi3.so
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: filegraph-native
+          path: src/amethyst_filegraph.abi3.so
+          if-no-files-found: error
+
+  flatpak:
+    name: Build Flatpak (${{ needs.meta.outputs.ostree }})
+    needs: [meta, filegraph]
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/flathub-infra/flatpak-github-actions:freedesktop-25.08
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: filegraph-native
+          path: src
+
+      - name: Assert the extension is where meson expects it
+        run: |
+          set -euo pipefail
+          test -x src/amethyst_filegraph.abi3.so
+          file src/amethyst_filegraph.abi3.so
+
+      - name: Build the Flatpak
+        uses: flatpak/flatpak-github-actions/flatpak-builder@v6
+        with:
+          manifest-path: flatpak/io.github.Amethyst.ModManager.yml
+          branch: ${{ needs.meta.outputs.ostree }}
+          cache-key: flatpak-builder-v2-${{ hashFiles('flatpak/io.github.Amethyst.ModManager.yml', 'flatpak/pypi-dependencies.yaml', 'flatpak/maturin.yaml', 'flatpak/Cargo.lock', 'flatpak/cargo-sources.json') }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: flatpak-repo
+          path: repo/
+          if-no-files-found: error
+          compression-level: 0
+
+  publish:
+    name: Publish to hub-viallon
+    needs: [meta, flatpak]
+    uses: aviallon/hub-viallon/.github/workflows/publish-flatpak.yml@main
+    with:
+      app-id: io.github.Amethyst.ModManager
+      ostree-branch: ${{ needs.meta.outputs.ostree }}
+      artifact: flatpak-repo
+      pages-dir: amethyst
+      # Explicit: inside a called workflow the `github` context refers to THIS
+      # (caller) repository, so the hub cannot be derived from github.repository.
+      hub-repo: aviallon/hub-viallon
+      subject: ${{ needs.meta.outputs.subject }}
+      title: Amethyst Mod Manager (viallon build)
+      homepage: https://github.com/aviallon/Amethyst-Mod-Manager
+      dry-run: ${{ needs.meta.outputs.dry == 'true' }}
+    secrets:
+      # The run belongs to THIS repository, so GITHUB_TOKEN cannot write to
+      # hub-viallon. An SSH deploy key (write access on hub-viallon only) is
+      # stored here as HUB_VIALLON_DEPLOY_KEY.
+      hub-deploy-key: ${{ secrets.HUB_VIALLON_DEPLOY_KEY }}
