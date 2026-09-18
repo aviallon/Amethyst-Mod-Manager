@@ -159,7 +159,13 @@ jobs:
       - name: Assert the extension is where meson expects it
         run: |
           set -euo pipefail
-          test -x src/amethyst_filegraph.abi3.so
+          # Existence, not the executable bit: actions/download-artifact does not
+          # preserve file modes, so the bit is always lost in transit. meson's
+          # install_data() sets the installed mode itself (install_mode:
+          # 'rwxr-xr-x'), so only the file's presence matters to the build.
+          test -f src/amethyst_filegraph.abi3.so
+          chmod +x src/amethyst_filegraph.abi3.so
+          ls -l src/amethyst_filegraph.abi3.so
           file src/amethyst_filegraph.abi3.so
 
       - name: Build the Flatpak
