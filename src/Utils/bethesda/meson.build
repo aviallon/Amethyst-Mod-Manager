@@ -1,5 +1,6 @@
 py.install_sources(
   '__init__.py',
+  '_selftest.py',
   'autoblend.py',
   'autoseasons.py',
   'acmos.py',

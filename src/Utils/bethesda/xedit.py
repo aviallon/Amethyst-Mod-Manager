@@ -36,6 +36,284 @@ def _noop(_msg: str) -> None:
 XEDIT_SAVE_TEMP_RE = _re.compile(r"^(?P<base>.+)\.save\.[0-9_]+$", _re.IGNORECASE)
 _PLUGIN_EXTS = (".esp", ".esm", ".esl")
 
+# Output-capture mod for QuickAutoClean results on VANILLA masters. A vanilla
+# master has no owning mod, so in-place cleaning would land in the vanilla
+# store (Data_Core/ under symlink deploy, or the live Data/ when undeployed)
+# where a Steam "verify integrity" reverts it and nothing records it. Seeding
+# the master into this mod before the deploy makes the mod layer above
+# Data_Core, so QAC's edit is captured and survives a verify/redeploy. Same
+# pattern as BodySlide's output mod.
+XEDIT_OUTPUT_MOD = "xEdit_QAC_Output"
+
+
+def _top_level_plugin_owners(filemap_path: Path) -> "dict[str, str]":
+    """{lowercased plugin name: owning mod} for top-level plugins in a
+    deployed filemap. Missing file -> empty map (everything looks vanilla)."""
+    owners: dict[str, str] = {}
+    try:
+        with filemap_path.open(encoding="utf-8", errors="surrogateescape") as fh:
+            for line in fh:
+                rel, sep, mod_name = line.rstrip("\n").partition("\t")
+                if sep and "/" not in rel.replace("\\", "/"):
+                    owners[rel.lower()] = mod_name
+    except OSError:
+        pass
+    return owners
+
+
+def vanilla_master_plugins(game: "BaseGame", names) -> "list[str]":
+    """Subset of *names* that are vanilla masters present on disk."""
+    try:
+        from Utils.games.registry import _vanilla_plugins_for_game
+        vanilla = {key.lower() for key in _vanilla_plugins_for_game(game)}
+    except Exception:
+        return []
+    return [name for name in names if str(name).lower() in vanilla]
+
+
+def _mod_provides_top_level_plugin(
+    game: "BaseGame", profile_dir: Path, lower_name: str,
+) -> "bool | None":
+    """Whether an enabled mod provides a top-level plugin, or None when we
+    have no authoritative ownership information.
+
+    The committed Filegraph deployment plan is the source the restore path
+    trusts. The legacy filemap is only a fallback (VFS deploys keep one; the
+    modern pipeline does not rebuild it). None means "don't guess" - the
+    caller then requires positive proof the file is vanilla before touching it.
+    """
+    try:
+        from Utils.filegraph.deploy import deployed_entries_for
+        entries = deployed_entries_for(game, profile_dir)
+    except Exception:
+        entries = ()
+    if entries:
+        for entry in entries:
+            rel = (entry.legacy_rel or "").replace("\\", "/")
+            if entry.legacy_root or "/" in rel:
+                continue
+            if rel.lower() == lower_name:
+                return True
+        return False
+    owners = _top_level_plugin_owners(Path(game.get_effective_filemap_path()))
+    if owners:
+        from Utils.filegraph.constants import OVERWRITE_NAME
+        owner = owners.get(lower_name)
+        if owner is None:
+            return False
+        return owner != OVERWRITE_NAME
+    return None
+
+
+def _deployed_plugin_is_vanilla(
+    game: "BaseGame", profile_dir: Path, data_dir: Path, name: str,
+) -> bool:
+    """Positive proof that the deployed *name* comes from the vanilla layer.
+
+    Uses committed Filegraph deployment ownership first, then the legacy
+    filemap. When neither knows, a plain (undeployed) game directory is all
+    vanilla, and a deployed one requires a symlink resolving into the vanilla
+    store (Data_Core/). Conservative by design - anything unclear is left
+    alone rather than risk shadowing a mod's cleaned copy with raw vanilla.
+    """
+    owned = _mod_provides_top_level_plugin(game, profile_dir, name.lower())
+    if owned is not None:
+        return not owned
+    try:
+        if not game.get_deploy_active():
+            # Nothing deployed: Data/ is the plain game install, i.e. vanilla.
+            return True
+    except Exception:
+        pass
+    try:
+        path = Path(data_dir) / name
+        if not path.is_symlink():
+            return False
+        target = Path(os.path.realpath(path))
+        data = Path(game.get_mod_data_path())
+        core = data.parent / f"{data.name}_Core"
+        try:
+            target.relative_to(core)
+            return True
+        except ValueError:
+            return False
+    except OSError:
+        return False
+
+
+def seed_vanilla_master_output(
+    game: "BaseGame", profile: str, plugins, *,
+    output_mod_name: str = XEDIT_OUTPUT_MOD, log_fn=None,
+) -> "list[str]":
+    """Capture dirty VANILLA masters into *output_mod_name* before a QAC run.
+
+    For every plugin in *plugins* that (a) is a vanilla master and (b) is not
+    provided by a real mod, copy the currently deployed vanilla file into an
+    output-capture mod that is enabled at the top of the profile's modlist.
+    After the wizard's deploy the master resolves to this mod, so
+    QuickAutoClean's in-place save lands in the mod instead of the vanilla
+    store. Non-vanilla plugins are left alone: their owning mod already
+    captures the edit.
+
+    Idempotent - an existing copy in the output mod is kept (it may already
+    hold a previous clean). Marks the profile staging dirty so the deploy
+    reconciles the newly created mod. Returns the plugin names seeded.
+    """
+    _log = log_fn or _noop
+    candidates = vanilla_master_plugins(game, plugins)
+    if not candidates:
+        return []
+    profile_dir = game.get_profile_root() / "profiles" / profile
+    try:
+        from Utils.vfs import effective_tool_data_root
+        data_dir = Path(effective_tool_data_root(game))
+    except Exception:
+        data_dir = game.get_mod_data_path()
+    if data_dir is None:
+        return []
+
+    to_seed: list[str] = []
+    for name in candidates:
+        if _deployed_plugin_is_vanilla(game, profile_dir, data_dir, name):
+            to_seed.append(name)
+        else:
+            _log(
+                f"xEdit: {name} is provided by a mod (or ownership is "
+                f"unknown) - leaving its QAC result in the owning mod.")
+    if not to_seed:
+        return []
+
+    from Utils.bethesda.bodyslide import ensure_output_mod
+    try:
+        mod_dir = ensure_output_mod(game, profile, output_mod_name)
+    except OSError as exc:
+        _log(f"xEdit: could not create '{output_mod_name}': {exc}")
+        return []
+
+    seeded: list[str] = []
+    for name in to_seed:
+        destination = mod_dir / name
+        if destination.exists():
+            seeded.append(name)   # already captured; keep the clean
+            continue
+        source = data_dir / name
+        if not source.is_file():
+            continue
+        try:
+            _copy_file_atomic(source, destination)
+            seeded.append(name)
+            _log(
+                f"xEdit: redirected vanilla master {name} into "
+                f"'{output_mod_name}' - QuickAutoClean will clean the mod, "
+                f"not the vanilla store.")
+        except OSError as exc:
+            _log(f"xEdit: could not seed {name} into '{output_mod_name}': {exc}")
+    if seeded:
+        try:
+            from Utils.filegraph.staleness import mark_staging_dirty
+            mark_staging_dirty(
+                profile_dir,
+                f"xEdit QAC seeded {len(seeded)} vanilla master(s) into "
+                f"'{output_mod_name}'",
+                log_fn=_log)
+        except Exception as exc:
+            _log(f"xEdit: could not mark staging dirty: {exc}")
+    return seeded
+
+
+def plugin_crc32(path: Path) -> "int | None":
+    """Standard CRC-32 (what LOOT/xEdit report) of a plugin, or None if it
+    cannot be read. Read in chunks so a 250 MB master does not blow memory."""
+    import zlib
+    try:
+        crc = 0
+        with Path(path).open("rb") as fh:
+            while chunk := fh.read(1024 * 1024):
+                crc = zlib.crc32(chunk, crc)
+        return crc & 0xFFFFFFFF
+    except OSError:
+        return None
+
+
+def _plugin_stat_key(path: Path) -> "tuple[int, int] | None":
+    try:
+        info = path.stat()
+        return (info.st_size, info.st_mtime_ns)
+    except OSError:
+        return None
+
+
+def snapshot_plugin_stats(data_dir: Path) -> "dict[str, tuple[int, int] | None]":
+    """Cheap (size, mtime) snapshot of every plugin in *data_dir*, keyed by
+    lowercased name. Used to find what an interactive tool run changed without
+    hashing every plugin."""
+    return {p.name.lower(): _plugin_stat_key(p) for p in _plugin_files(data_dir)}
+
+
+def plugins_changed_since(
+    data_dir: Path, baseline: "dict[str, tuple[int, int] | None]",
+) -> "list[str]":
+    """Plugin names whose (size, mtime) differs from *baseline* (or that are
+    newly present)."""
+    changed: list[str] = []
+    for plugin in _plugin_files(data_dir):
+        key = plugin.name.lower()
+        if baseline.get(key) != _plugin_stat_key(plugin):
+            changed.append(plugin.name)
+    return changed
+
+
+def clean_plugin_to_fixed_point(
+    plugin_path: Path, run_pass, *, max_passes: int = 4,
+    label: str = "", log_fn=None,
+) -> dict:
+    """Run QuickAutoClean for one plugin until its CRC stops changing.
+
+    xEdit's ``-quickautoclean`` is per-plugin (it refuses to start with more
+    than one tagged plugin) and already performs up to three internal cleaning
+    passes with autosaves; but a pass can leave records that only a *fresh
+    process* (reloaded masters) cleans, which is why users end up relaunching
+    it by hand (Dawnguard.esm 0x6CEC879A -> 0x5E96652C -> 0x5EE2397D). Calling
+    ``run_pass()`` (one launch of the tool for this plugin) until the CRC is
+    stable reaches the same terminal state without user interaction.
+
+    *run_pass* must launch QAC for this exact plugin and return when it has
+    exited (and any ``<name>.save.<ts>`` rename has been finalised).
+    Returns a dict with plugin/crc_before/crc_after/passes/converged.
+    """
+    _log = log_fn or _noop
+    name = label or plugin_path.name
+    before = plugin_crc32(plugin_path) if plugin_path.is_file() else None
+    previous = before
+    passes = 0
+    converged = False
+    for attempt in range(1, max_passes + 1):
+        run_pass()
+        passes = attempt
+        current = plugin_crc32(plugin_path) if plugin_path.is_file() else None
+        fmt = lambda value: ("-" if value is None else f"0x{value:08X}")
+        if current == previous:
+            _log(
+                f"xEdit QAC: {name} pass {attempt}: "
+                f"{fmt(previous)} -> {fmt(current)} (stable)")
+            converged = True
+            break
+        _log(
+            f"xEdit QAC: {name} pass {attempt}: "
+            f"{fmt(previous)} -> {fmt(current)}")
+        previous = current
+    if not converged:
+        _log(
+            f"xEdit QAC: {name} did not reach a stable CRC after "
+            f"{max_passes} pass(es) - stopping.")
+    return {
+        "plugin": name,
+        "crc_before": before,
+        "crc_after": previous,
+        "passes": passes,
+        "converged": converged,
+    }
+
 
 @dataclass
 class XEditVFSSession:

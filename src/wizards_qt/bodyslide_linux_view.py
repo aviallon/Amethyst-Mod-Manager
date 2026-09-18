@@ -335,6 +335,9 @@ class BodySlideLinuxView(WizardViewBase):
                                   "done, then click Done.").format(name), "")
                 safe_emit(self._run_started_sig)
                 run_logged(program, env, log_fn=self._log_tool, label=name)
+                from wizards_qt import notify_wizard_output
+                notify_wizard_output(self._ctx, "BodySlide wrote output",
+                                     self._log_tool)
                 self._log_tool(f"{name} closed.")
                 safe_emit(self._run_status_sig,
                           self.tr("{0} finished.").format(name), ok_text())
