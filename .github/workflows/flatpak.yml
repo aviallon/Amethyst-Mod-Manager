@@ -146,6 +146,13 @@ jobs:
     runs-on: ubuntu-latest
     container:
       image: ghcr.io/flathub-infra/flatpak-github-actions:freedesktop-25.08
+      # flatpak-builder sandboxes every module build with bwrap, which needs to
+      # create a user namespace. An unprivileged container cannot, and each
+      # module then dies with:
+      #   bwrap: No permissions to create a new namespace, likely because the
+      #   kernel does not allow non-privileged user namespaces.
+      # Upstream's own container jobs pass --privileged for the same reason.
+      options: --privileged
     steps:
       - uses: actions/checkout@v4
         with:
