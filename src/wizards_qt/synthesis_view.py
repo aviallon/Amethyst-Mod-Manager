@@ -346,6 +346,9 @@ class SynthesisView(WizardViewBase):
             self._mygames_link = symlink_mygames(self._game, self._setup_log_line)
             launch_synthesis(self._game, self._selected_proton, profile,
                              self._setup_log_line)
+            from wizards_qt import notify_wizard_output
+            notify_wizard_output(self._ctx, "Synthesis wrote its patch output",
+                                 self._setup_log_line)
         finally:
             remove_symlinks(self._plugins_links, self._setup_log_line)
             if self._mygames_link is not None:

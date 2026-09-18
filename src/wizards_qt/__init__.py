@@ -57,6 +57,9 @@ class QtWizardContext:
     panels (footer Refresh).  refresh_plugins() re-runs LOOT to refresh plugin
     metadata WITHOUT reordering the load order (footer Refresh Plugins) - used by
     the xEdit wizards after a clean/edit session so dirty/message flags update.
+    mark_staging_dirty(reason) flags the active profile's Filegraph catalog as
+    stale after a wizard wrote tool output directly into staging, so the next
+    deploy reconciles from disk instead of reusing the old winner generation.
     import_manifest(manifest, source_stem, bundle_zip) opens the Profile-import
     tab (the collection detail + install pipeline) for an already-parsed
     Amethyst manifest - used by the curated-profile wizard. current_profile()
@@ -83,6 +86,7 @@ class QtWizardContext:
     run_restore: Callable | None = None
     refresh_modlist: Callable | None = None
     refresh_plugins: Callable | None = None
+    mark_staging_dirty: Callable | None = None
     import_manifest: Callable | None = None
     current_profile: Callable | None = None
     nexus_api: Callable | None = None
@@ -94,6 +98,22 @@ class QtWizardContext:
     wizard_tool_id: str = ""
     wizard_tool_label: str = ""
     wizard_tool_label_args: tuple = ()
+
+
+def notify_wizard_output(ctx, reason: str, log_fn=None) -> None:
+    """Flag the active profile's Filegraph catalog stale after a wizard tool
+    wrote output straight into staging (Pandora, BodySlide, DynDOLOD, xEdit
+    QAC, …). The next deploy reconciles from disk instead of reusing the old
+    winner generation, so the output is included even when the wizard tab has
+    not been closed yet. Never raises."""
+    hook = getattr(ctx, "mark_staging_dirty", None)
+    if not callable(hook):
+        return
+    try:
+        hook(reason)
+    except Exception as exc:
+        if log_fn is not None:
+            log_fn(f"Could not mark staging dirty: {exc}")
 
 
 # Deliberately dropped from the Qt app (not even shown greyed out).

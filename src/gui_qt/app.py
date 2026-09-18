@@ -14311,6 +14311,7 @@ class MainWindow(QMainWindow):
             run_restore=self._wizard_run_restore,
             refresh_modlist=self._on_refresh_modlist,
             refresh_plugins=self._wizard_refresh_plugins,
+            mark_staging_dirty=self._wizard_mark_staging_dirty,
             import_manifest=lambda manifest, stem, bundle_zip:
                 self._open_manifest_import(manifest, stem, bundle_zip=bundle_zip),
             current_profile=lambda: self._gs.profile or "default",
@@ -14451,6 +14452,19 @@ class MainWindow(QMainWindow):
         self._restore_done_hooks.append(on_done)
         self._on_restore()
         return True
+
+    def _wizard_mark_staging_dirty(self, reason: str = "") -> None:
+        """Wizard hook: flag the LIVE active profile's catalog as stale after
+        the wizard wrote tool output (Pandora, BodySlide, DynDOLOD, xEdit QAC,
+        …) directly into staging. The next deploy rebuilds the catalog before
+        planning, so the output is included even when the deploy happens
+        before the wizard tab is closed (the only other catalog rebuild)."""
+        profile_dir = self._gs.profile_dir()
+        if profile_dir is None:
+            return
+        from Utils.filegraph.staleness import mark_staging_dirty
+        mark_staging_dirty(profile_dir, reason,
+                           log_fn=lambda m: self._append_log(str(m)))
 
     def _wizard_refresh_plugins(self):
         """Wizard hook: re-run LOOT to refresh plugin metadata without touching
@@ -17303,6 +17317,13 @@ class MainWindow(QMainWindow):
         force a full index rescan (picks up files added/removed inside mods)."""
         from Utils.mods.modlist import sync_modlist_with_mods_folder
         self._reassert_profile_paths()
+        # Refresh does a full catalog rebuild below; drop any wizard-output
+        # marker so the next deploy doesn't repeat that rebuild for nothing.
+        try:
+            from Utils.filegraph.staleness import consume_staging_dirty
+            consume_staging_dirty(self._gs.profile_dir())
+        except Exception:
+            pass
         # Refresh doubles as the user's "reconcile my group now" button; must
         # run before the folder sync (which drops entries with missing dirs).
         try:

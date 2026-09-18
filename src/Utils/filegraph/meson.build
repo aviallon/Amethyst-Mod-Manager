@@ -1,5 +1,6 @@
 py.install_sources(
   '__init__.py',
+  '_selftest.py',
   'adapter.py',
   'archives.py',
   'constants.py',
@@ -9,5 +10,6 @@ py.install_sources(
   'native.py',
   'paths.py',
   'service.py',
+  'staleness.py',
   subdir: 'Utils/filegraph',
 )
