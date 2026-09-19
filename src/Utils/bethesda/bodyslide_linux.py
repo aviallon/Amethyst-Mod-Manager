@@ -40,6 +40,7 @@ from __future__ import annotations
 import os
 import re
 import shutil
+import signal
 import subprocess
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable
@@ -329,10 +330,91 @@ def build_env(game: "BaseGame", profile: str, output_dir: Path, *,
 _GTK_NOISE = re.compile(r"\b(Gtk|Gdk|GLib|GLib-GObject)-(WARNING|Message|CRITICAL)\b")
 
 
+# Exit codes invented by the watchdog below, so a caller can tell "we stopped it"
+# from "it crashed". Both are negative and outside the range a real process
+# reports, and distinct from -9 (the OOM killer) and -15 (someone's SIGTERM).
+EXIT_MEMORY_GUARD = -100
+EXIT_TIMEOUT = -101
+
+
+def _page_size_kb() -> int:
+    try:
+        return os.sysconf("SC_PAGE_SIZE") // 1024
+    except (ValueError, OSError, AttributeError):
+        return 4
+
+
+def _rss_mb(pid: int, scale: float) -> float:
+    """Resident memory of one process in MiB, or 0.0 if it is gone.
+
+    /proc/<pid>/statm is "size resident shared text lib data dt" in pages. It
+    is used instead of /proc/<pid>/stat because stat's comm field is
+    parenthesised and may contain spaces, which makes its field offsets a
+    classic source of silently wrong numbers.
+    """
+    try:
+        with open(f"/proc/{pid}/statm", "rb") as handle:
+            return int(handle.read().split()[1]) * scale
+    except (OSError, IndexError, ValueError):
+        return 0.0
+
+
+def _parent_pid(pid: int) -> int:
+    try:
+        with open(f"/proc/{pid}/status", "rb") as handle:
+            for line in handle:
+                if line.startswith(b"PPid:"):
+                    return int(line.split()[1])
+    except (OSError, IndexError, ValueError):
+        pass
+    return 0
+
+
+def process_tree_rss_mb(root: int) -> float:
+    """Resident memory of *root* and every descendant, in MiB.
+
+    The launcher is a shell script that execs Wine which execs the real
+    BodySlide.exe, so the interesting memory is never in *root* itself. Nothing
+    here is Wine-specific: it walks /proc, summing resident memory over the
+    process tree.
+
+    Returns 0.0 when /proc cannot be read (non-Linux, or the process has gone).
+    """
+    scale = _page_size_kb() / 1024.0
+    try:
+        entries = os.listdir("/proc")
+    except OSError:
+        return 0.0
+    children: dict[int, list[int]] = {}
+    rss: dict[int, float] = {}
+    for name in entries:
+        if not name.isdigit():
+            continue
+        pid = int(name)
+        rss[pid] = _rss_mb(pid, scale)
+        parent = _parent_pid(pid)
+        if parent:
+            children.setdefault(parent, []).append(pid)
+    total = 0.0
+    seen: set[int] = set()
+    stack = [root]
+    while stack:
+        pid = stack.pop()
+        if pid in seen:
+            continue
+        seen.add(pid)
+        total += rss.get(pid, 0.0)
+        stack.extend(children.get(pid, ()))
+    return total
+
+
 def run_logged(program: str, env: dict, *,
                log_fn: Callable[[str], None] = _noop,
                label: str = "BodySlide",
-               args: "list[str] | None" = None) -> int:
+               args: "list[str] | None" = None,
+               max_rss_mb: "float | None" = None,
+               timeout_s: "float | None" = None,
+               poll_s: float = 0.5) -> int:
     """Run the tarball launcher for *program*, streaming output to *log_fn*.
 
     *args* are extra command-line arguments; with none the program starts
@@ -340,10 +422,21 @@ def run_logged(program: str, env: dict, *,
     --preset/--trimorphs/--preview, so --groupbuild is how an unattended build
     is requested - see Utils/bethesda/bodyslide_auto.py.
 
+    *max_rss_mb* and *timeout_s*, when given, put a ceiling on one run: the
+    whole process tree is polled, and on breach it is killed and
+    EXIT_MEMORY_GUARD / EXIT_TIMEOUT is returned. BodySlide asks for memory as
+    a function of the outfit it is on, not of the batch, so a cap on the batch
+    cannot bound one chunk - a watchdog is the only thing that keeps the kernel
+    from reaching for the OOM killer, which takes the whole machine's
+    responsiveness with it.
+
     Blocks until the tool exits - call from a worker thread. No flatpak-spawn
     hop: the bundle carries its own loader and libc, so it runs inside our
     sandbox as-is.
     """
+    import threading
+    import time
+
     launcher = launcher_path(program)
     home = os.path.expanduser("~")
     cwd = home if os.path.isdir(home) else "/"
@@ -359,6 +452,8 @@ def run_logged(program: str, env: dict, *,
             stderr=subprocess.STDOUT,
             bufsize=1,
             universal_newlines=True,
+            # own session, so killing the run kills Wine and the real exe too
+            start_new_session=True,
         )
     except OSError as exc:
         log_fn(f"{label}: failed to launch - {exc}")
@@ -366,17 +461,64 @@ def run_logged(program: str, env: dict, *,
 
     assert proc.stdout is not None
     suppressed = 0
-    for line in proc.stdout:
-        line = line.rstrip("\n")
-        if not line:
-            continue
-        if _GTK_NOISE.search(line):
-            suppressed += 1
-        else:
-            log_fn(f"{label}: {line}")
+    state = {"lines": 0}
+
+    def drain() -> None:
+        nonlocal suppressed
+        try:
+            for raw in proc.stdout:  # type: ignore[union-attr]
+                line = raw.rstrip("\n")
+                if not line:
+                    continue
+                if _GTK_NOISE.search(line):
+                    suppressed += 1
+                else:
+                    state["lines"] += 1
+                    log_fn(f"{label}: {line}")
+        except (ValueError, OSError):
+            pass  # pipe closed under us when the process was killed
+
+    reader = threading.Thread(target=drain, name=f"{label}-log", daemon=True)
+    reader.start()
+
+    killed: int | None = None
+    started = time.monotonic()
+    peak = 0.0
+    while True:
+        try:
+            proc.wait(timeout=poll_s)
+            break
+        except subprocess.TimeoutExpired:
+            pass
+        if max_rss_mb is not None and killed is None:
+            used = process_tree_rss_mb(proc.pid)
+            peak = max(peak, used)
+            if used > max_rss_mb:
+                log_fn(f"{label}: using {used:.0f} MB after "
+                       f"{time.monotonic() - started:.0f}s, over the "
+                       f"{max_rss_mb:.0f} MB limit - stopping it here rather "
+                       f"than letting the OOM killer take the machine.")
+                killed = EXIT_MEMORY_GUARD
+        if (timeout_s is not None and killed is None
+                and time.monotonic() - started > timeout_s):
+            log_fn(f"{label}: still running after {timeout_s:.0f}s - stopping it.")
+            killed = EXIT_TIMEOUT
+        if killed is not None:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+            break
+
     rc = proc.wait()
+    reader.join(timeout=2.0)
+    if killed is not None:
+        rc = killed
     if suppressed:
         log_fn(f"{label}: suppressed {suppressed} GTK warning line(s).")
-    if rc != 0:
+    if killed is not None:
+        log_fn(f"{label}: killed by the watchdog (peak {peak:.0f} MB, "
+               f"{time.monotonic() - started:.0f}s, {state['lines']} log line(s))")
+    elif rc != 0:
         log_fn(f"{label}: exited with code {rc}")
     return rc

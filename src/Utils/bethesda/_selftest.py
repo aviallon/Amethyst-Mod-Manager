@@ -8,12 +8,14 @@ Run from the repository root with::
 
 from __future__ import annotations
 
+import os
 import tempfile
 import unittest
 import zlib
 from pathlib import Path
 
 from Utils.bethesda import bodyslide_auto, xedit
+from Utils.bethesda.bodyslide_linux import process_tree_rss_mb
 from Utils.filegraph import staleness
 
 
@@ -546,6 +548,58 @@ class BodySlideChunkTests(unittest.TestCase):
         self.assertTrue(alts[0].certain)
         skip = bodyslide_auto.skipped_groups(alts, {})
         self.assertEqual(len(skip), 1, "exactly one variant is built")
+
+
+    def test_isolate_failures_names_the_offending_outfit(self) -> None:
+        """A dying chunk must end up as ONE named outfit, and the rest must build.
+
+        This is the behaviour the whole chunked build rests on: BodySlide asks
+        for memory as a function of the outfit it is on, so a chunk failing says
+        nothing about which of its 48 outfits did it, and reporting the chunk
+        would leave the user with no idea what to look at.
+        """
+        bad = "CBBE Dragonborn - Body - Telvanni"
+        members = [f"Outfit {i:02d}" for i in range(15)] + [bad]
+        calls: list[list[str]] = []
+
+        def run(_group: str, names: list[str]) -> int:
+            calls.append(list(names))
+            return -100 if bad in names else 0  # -100 = the memory watchdog
+
+        logs: list[str] = []
+        failed = bodyslide_auto.isolate_failures(run, members, log_fn=logs.append,
+                                                 tag="t")
+        self.assertEqual(failed, [bad])
+        self.assertIn([bad], calls, "the culprit must be tried on its own")
+        # Every OTHER outfit must have been in a call that succeeded. Halving
+        # does also try some siblings alone on the way down - that is fine and
+        # free - but none of them may be left unbuilt or reported as failed.
+        built: set[str] = set()
+        for names in calls:
+            if bad not in names:
+                built.update(names)
+        self.assertEqual(built, set(members) - {bad},
+                         "only the offending outfit may be left unbuilt")
+        self.assertTrue(any("failed on its own" in m for m in logs), logs)
+
+    def test_isolate_failures_is_a_noop_when_the_chunk_builds(self) -> None:
+        calls: list[list[str]] = []
+
+        def run(_group: str, names: list[str]) -> int:
+            calls.append(list(names))
+            return 0
+
+        self.assertEqual(
+            bodyslide_auto.isolate_failures(run, ["A", "B", "C", "D"]), [])
+        self.assertEqual(len(calls), 1, "a healthy chunk is run exactly once")
+
+    def test_process_tree_rss_mb_reports_our_own_memory(self) -> None:
+        rss = process_tree_rss_mb(os.getpid())
+        self.assertGreater(rss, 0.0)
+        self.assertLess(rss, 100_000.0)
+
+    def test_process_tree_rss_mb_survives_a_missing_pid(self) -> None:
+        self.assertEqual(process_tree_rss_mb(999_999_998), 0.0)
 
 
 if __name__ == "__main__":
