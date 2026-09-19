@@ -50,6 +50,13 @@ CHUNK_PREFIX = "ZZAutoChunk_"
 # (CBBE's whole 492-outfit set is ~39k and builds fine on its own).
 DEFAULT_MAX_DATA_PER_CHUNK = 8000
 
+# Outfits per chunk. This, not the data budget, is what actually bounds memory:
+# measured on one load order, chunks with ~8000 data entries and 87 outfits took
+# 15s and lived, while a 210-outfit chunk of COMPARABLE data volume reached
+# 32.7 GB and was OOM-killed (~150 MB per outfit, each loading its own source
+# mesh and OSD data). Chunks are split on whichever budget trips first.
+DEFAULT_MAX_OUTFITS_PER_CHUNK = 48
+
 _STAMP_NAME = "BodySlide_auto_stamp.json"
 
 
@@ -76,6 +83,27 @@ class Chunk:
     @property
     def label(self) -> str:
         return f"{self.group} ({len(self.outfits)} outfits, {self.data} data)"
+
+
+@dataclass
+class Alternative:
+    """Groups that cover substantially the same outfits - pick one.
+
+    A body shape or a physics variant ships the same outfits again under a
+    different group (CBBE vs 3BA vs BHUNP vs HIMBO, with and without physics),
+    so building all of them duplicates work and multiplies memory for meshes the
+    user will never see. Detected from member overlap, not from names: names are
+    a hint for the UI, but two groups that list the same outfits ARE
+    alternatives whatever they are called.
+    """
+    key: str                       # stable id, used to store the choice
+    groups: list[str] = field(default_factory=list)
+    members: int = 0               # outfits in the largest candidate
+    hint: str = ""                 # e.g. "body shape" / "physics", for the UI
+    certain: bool = False          # near-identical membership: safe to skip
+    #                               by default. Weak candidates (a shared name
+    #                               prefix) are only OFFERED - skipping on a name
+    #                               guess would silently drop wanted outfits.
 
 
 # ---------------------------------------------------------------------------
@@ -159,14 +187,16 @@ def discover_groups(game: "BaseGame") -> dict[str, list[str]]:
 # ---------------------------------------------------------------------------
 
 def _split_budget(names: list[str], cost: dict[str, int], budget: int,
-                  prefix: str) -> list[Chunk]:
-    """Greedy split of *names* into budget-sized synthetic chunks."""
+                  prefix: str, max_outfits: int) -> list[Chunk]:
+    """Greedy split of *names* into chunks within BOTH budgets."""
     chunks: list[Chunk] = []
     bucket: list[str] = []
     used = 0
     part = 0
     for name in names:
-        if bucket and used + cost.get(name, 0) > budget:
+        too_big = (bucket and (used + cost.get(name, 0) > budget
+                               or len(bucket) >= max_outfits))
+        if too_big:
             part += 1
             chunks.append(Chunk(group=f"{prefix}_{part}", outfits=bucket,
                                 data=used, temporary=True))
@@ -182,42 +212,200 @@ def _split_budget(names: list[str], cost: dict[str, int], budget: int,
 
 def plan_chunks(groups: dict[str, list[str]], outfits: list[Outfit], *,
                 max_data_per_chunk: int = DEFAULT_MAX_DATA_PER_CHUNK,
+                max_outfits_per_chunk: int = DEFAULT_MAX_OUTFITS_PER_CHUNK,
+                skip_groups: "set[str] | None" = None,
                 ) -> list[Chunk]:
     """Turn groups into an ordered list of process invocations.
 
-    A group at or under the budget becomes one chunk. A heavier group is split
-    into synthetic sub-groups. Outfits in NO group are split by the same budget
-    rather than collected into one chunk: several packs (CBBE, for one) ship no
-    slider groups at all, so a single "everything else" chunk would recreate the
-    unbounded batch build this module exists to avoid - and the first automatic
-    run builds everything, groups or not.
+    A group within both budgets becomes one chunk. A heavier group is split into
+    synthetic sub-groups. Outfits in NO group are split by the same budgets
+    rather than collected into one chunk: several packs ship no slider groups at
+    all, so a single "everything else" chunk would recreate the unbounded batch
+    build this module exists to avoid.
+
+    *skip_groups* holds groups the user did not choose (see choose_alternatives);
+    their outfits are left out entirely rather than built and discarded.
     """
     cost = {o.name: o.data for o in outfits}
+    skip = skip_groups or set()
     grouped: set[str] = set()
     chunks: list[Chunk] = []
 
     for name, members in groups.items():
         known = [m for m in members if m in cost]
+        if name in skip:
+            grouped.update(known)      # counted as covered, deliberately not built
+            continue
         grouped.update(known)
         if not known:
             continue
         total = sum(cost[m] for m in known)
-        if total <= max_data_per_chunk:
+        if total <= max_data_per_chunk and len(known) <= max_outfits_per_chunk:
             chunks.append(Chunk(group=name, outfits=known, data=total))
         else:
             chunks.extend(_split_budget(known, cost, max_data_per_chunk,
-                                        f"{CHUNK_PREFIX}{name}"))
+                                        f"{CHUNK_PREFIX}{name}",
+                                        max_outfits_per_chunk))
 
     loose = [o.name for o in outfits if o.name not in grouped]
     if loose:
         total = sum(cost[n] for n in loose)
-        if total <= max_data_per_chunk:
+        if total <= max_data_per_chunk and len(loose) <= max_outfits_per_chunk:
             chunks.append(Chunk(group=f"{CHUNK_PREFIX}ungrouped", outfits=loose,
                                 data=total, temporary=True))
         else:
             chunks.extend(_split_budget(loose, cost, max_data_per_chunk,
-                                        f"{CHUNK_PREFIX}ungrouped"))
+                                        f"{CHUNK_PREFIX}ungrouped",
+                                        max_outfits_per_chunk))
     return chunks
+
+
+# ---------------------------------------------------------------------------
+# Alternatives - one body shape / physics variant, not all of them
+# ---------------------------------------------------------------------------
+
+# Tokens that say what an alternative is ABOUT. Used only to label the choice in
+# the UI; the grouping itself is decided by member overlap, because two groups
+# that list the same outfits are alternatives whatever they are called.
+_HINT_TOKENS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("body shape", ("3ba", "bhunp", "uunp", "cbbe", "himbo", "tng", "sos",
+                    "males", "females")),
+    ("physics", ("physics", "hdt", "smp")),
+)
+
+
+def _hint_for(names: list[str]) -> str:
+    low = " ".join(names).lower()
+    hits = [label for label, tokens in _HINT_TOKENS
+            if any(t in low for t in tokens)]
+    return ", ".join(hits)
+
+
+def detect_alternatives(groups: dict[str, list[str]], outfits: list[Outfit],
+                        *, threshold: float = 0.85,
+                        min_members: int = 2) -> list[Alternative]:
+    """Group sets that are candidates for "pick one".
+
+    Two signals, and they are NOT equally trustworthy:
+
+    * OVERLAP (certain): two groups share at least *threshold* of the LARGER
+      one, so they are the same outfit list under two names - a physics or body
+      variant. Building both duplicates work and multiplies memory.
+      Normalising by the larger set matters: normalising by the smaller one
+      merged a 5-outfit 'CBBE' group with the 32-outfit 'CBBE Vanilla Outfits',
+      which is a SUBSET, not an alternative, and would have dropped 32 outfits.
+    * NAME PREFIX (candidate only): groups whose names share a prefix often are
+      variants whose members are named differently (a body installed for SOS vs
+      for vanilla), so overlap cannot see it. Offered, never skipped on its own -
+      a name guess is not good enough to drop someone's outfits.
+    """
+    known = {o.name for o in outfits}
+    members = {name: {m for m in ms if m in known}
+               for name, ms in groups.items()}
+    names = sorted(n for n, ms in members.items() if len(ms) >= min_members)
+
+    parent = {n: n for n in names}
+
+    def find(x: str) -> str:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a: str, b: str) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[max(ra, rb)] = min(ra, rb)
+
+    certain_pairs: set[frozenset[str]] = set()
+    for i, a in enumerate(names):
+        for b in names[i + 1:]:
+            larger = max(len(members[a]), len(members[b]))
+            if not larger:
+                continue
+            if len(members[a] & members[b]) / larger >= threshold:
+                union(a, b)
+                certain_pairs.add(frozenset((a, b)))
+
+    sets: dict[str, list[str]] = {}
+    for n in names:
+        sets.setdefault(find(n), []).append(n)
+
+    out: list[Alternative] = []
+    seen: set[str] = set()
+    for root, group_names in sets.items():
+        if len(group_names) < 2:
+            continue
+        group_names.sort()
+        biggest = max(len(members[n]) for n in group_names)
+        certain = all(frozenset(p) in certain_pairs
+                      for p in zip(group_names, group_names[1:]))
+        out.append(Alternative(key=root, groups=group_names, members=biggest,
+                               hint=_hint_for(group_names), certain=certain))
+        seen.update(group_names)
+
+    # Weak candidates: same leading word(s), left for the user to decide.
+    for prefix_len in (2, 1):
+        buckets: dict[str, list[str]] = {}
+        for n in names:
+            if n in seen:
+                continue
+            toks = n.split()
+            if len(toks) >= prefix_len:
+                buckets.setdefault(" ".join(toks[:prefix_len]), []).append(n)
+        for prefix, group_names in buckets.items():
+            if len(group_names) < 2 or not _hint_for(group_names):
+                continue
+            group_names.sort()
+            biggest = max(len(members[n]) for n in group_names)
+            out.append(Alternative(key=f"prefix:{prefix}", groups=group_names,
+                                   members=biggest,
+                                   hint=_hint_for(group_names), certain=False))
+            seen.update(group_names)
+    return sorted(out, key=lambda a: a.key)
+
+
+def skipped_groups(alternatives: list[Alternative],
+                   choices: dict[str, str]) -> set[str]:
+    """Groups to leave out because the user chose a sibling alternative instead.
+
+    A stored choice always wins. Without one, only a CERTAIN set is reduced to
+    its first group; a weak candidate is left alone, because building an
+    unwanted variant costs time while skipping a wanted one loses meshes - and
+    the log says plainly which groups were built and which were skipped.
+    """
+    skip: set[str] = set()
+    for alt in alternatives:
+        chosen = choices.get(alt.key)
+        if chosen not in alt.groups:
+            if not alt.certain and chosen is None:
+                continue
+            chosen = alt.groups[0]
+        skip.update(g for g in alt.groups if g != chosen)
+    return skip
+
+
+def choices_path(game: "BaseGame", profile: str) -> Path:
+    from Utils.bethesda.bodyslide_linux import data_dir
+    return data_dir(game, profile) / "BodySlide_auto_choices.json"
+
+
+def load_choices(game: "BaseGame", profile: str) -> dict[str, str]:
+    try:
+        data = json.loads(choices_path(game, profile).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return {k: v for k, v in data.items() if isinstance(v, str)}
+
+
+def save_choices(game: "BaseGame", profile: str, choices: dict[str, str]) -> None:
+    path = choices_path(game, profile)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(choices, indent=2, sort_keys=True) + "\n",
+                        encoding="utf-8")
+    except OSError as exc:
+        raise RuntimeError(f"could not save alternative choices: {exc}") from exc
 
 
 # ---------------------------------------------------------------------------
@@ -315,6 +503,19 @@ def stamp_path(game: "BaseGame", profile: str) -> Path:
     return data_dir(game, profile) / _STAMP_NAME
 
 
+def _fingerprint_inputs(game: "BaseGame", profile: str,
+                       groups: dict[str, list[str]], outfits: list[Outfit]) -> str:
+    """One fingerprint used by BOTH is_stale() and run_automatic().
+
+    They must agree exactly, or a fresh build would look stale forever. The
+    alternative choices belong in here: picking a different body shape changes
+    which outfits are built.
+    """
+    choices = load_choices(game, profile)
+    return fingerprint(game, profile, groups, outfits,
+                       extra=json.dumps(choices, sort_keys=True))
+
+
 def is_stale(game: "BaseGame", profile: str) -> tuple[bool, str]:
     """(needs_build, reason). A missing or unreadable stamp means stale."""
     try:
@@ -326,7 +527,7 @@ def is_stale(game: "BaseGame", profile: str) -> tuple[bool, str]:
         return False, "no BodySlide outfits deployed"
     if not groups:
         return True, "no slider groups deployed to chunk by"
-    want = fingerprint(game, profile, groups, outfits)
+    want = _fingerprint_inputs(game, profile, groups, outfits)
     try:
         data = json.loads(stamp_path(game, profile).read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -357,8 +558,9 @@ def write_stamp(game: "BaseGame", profile: str, fingerprint_value: str,
 def run_chunked(game: "BaseGame", profile: str, *, output_dir: Path,
                 log_fn: Callable[[str], None] = _noop,
                 max_data_per_chunk: int = DEFAULT_MAX_DATA_PER_CHUNK,
+                max_outfits_per_chunk: int = DEFAULT_MAX_OUTFITS_PER_CHUNK,
                 trimorphs: bool = True) -> int:
-    """Build every group, one process per chunk. Returns the number of failures.
+    """Build every chosen group, one process per chunk. Returns failures.
 
     Never raises for a single chunk failing: a build that dies on chunk 7 of 12
     must still report 1..6 as done, and the caller can retry cheaply because
@@ -373,7 +575,24 @@ def run_chunked(game: "BaseGame", profile: str, *, output_dir: Path,
 
     groups = discover_groups(game)
     outfits = discover_outfits(game)
-    chunks = plan_chunks(groups, outfits, max_data_per_chunk=max_data_per_chunk)
+    alternatives = detect_alternatives(groups, outfits)
+    choices = load_choices(game, profile)
+    skip = skipped_groups(alternatives, choices)
+    if alternatives:
+        for alt in alternatives:
+            chosen = choices.get(alt.key) or alt.groups[0]
+            if chosen not in alt.groups:
+                chosen = alt.groups[0]
+            others = [g for g in alt.groups if g != chosen]
+            label = f" ({alt.hint})" if alt.hint else ""
+            log_fn(f"BodySlide: alternative{label} - building '{chosen}', "
+                   f"skipping {', '.join(repr(o) for o in others)}"
+                   f" [change in the wizard's alternatives list]")
+
+    chunks = plan_chunks(groups, outfits,
+                         max_data_per_chunk=max_data_per_chunk,
+                         max_outfits_per_chunk=max_outfits_per_chunk,
+                         skip_groups=skip)
     if not chunks:
         log_fn("BodySlide: nothing to build (no outfits or groups).")
         return 0
@@ -385,9 +604,11 @@ def run_chunked(game: "BaseGame", profile: str, *, output_dir: Path,
 
     failures = 0
     total_data = sum(c.data for c in chunks)
+    total_outfits = sum(len(c.outfits) for c in chunks)
     env = build_env(game, profile, output_dir, log_fn=log_fn)
-    log_fn(f"BodySlide: {len(chunks)} chunk(s), {len(outfits)} outfits, "
-           f"{total_data} slider-data entries, limit {max_data_per_chunk}/chunk.")
+    log_fn(f"BodySlide: {len(chunks)} chunk(s), {total_outfits} outfits, "
+           f"{total_data} slider-data entries "
+           f"(caps {max_outfits_per_chunk} outfits / {max_data_per_chunk} data).")
     try:
         for index, chunk in enumerate(chunks, 1):
             args = [f"--groupbuild={chunk.group}", f"--targetdir={output_dir}"]
@@ -491,14 +712,16 @@ def run_automatic(game: "BaseGame", profile: str,
 
         groups = discover_groups(game)
         outfits = discover_outfits(game)
-        chunks = plan_chunks(groups, outfits)
-        log_fn(f"BodySlide: building {len(outfits)} outfits in {len(chunks)} "
-               f"chunk(s)…")
-        status(f"Building {len(outfits)} BodySlide outfits "
-               f"({len(chunks)} chunks)…")
+        alternatives = detect_alternatives(groups, outfits)
+        skip = skipped_groups(alternatives, load_choices(game, profile))
+        chunks = plan_chunks(groups, outfits, skip_groups=skip)
+        log_fn(f"BodySlide: building {sum(len(c.outfits) for c in chunks)} "
+               f"outfits in {len(chunks)} chunk(s)…")
+        status(f"Building {sum(len(c.outfits) for c in chunks)} BodySlide "
+               f"outfits ({len(chunks)} chunks)…")
 
         output_dir.mkdir(parents=True, exist_ok=True)
-        want = fingerprint(game, profile, groups, outfits)
+        want = _fingerprint_inputs(game, profile, groups, outfits)
         failures = run_chunked(game, profile, output_dir=output_dir,
                                log_fn=log_fn)
         if failures:
@@ -507,8 +730,9 @@ def run_automatic(game: "BaseGame", profile: str,
             status(f"BodySlide: {failures} chunk(s) failed - see the log")
             return
         write_stamp(game, profile, want,
-                    chunks=len(chunks), built=len(outfits))
-        log_fn(f"BodySlide: automatic build complete ({len(outfits)} outfits).")
+                    chunks=len(chunks),
+                    built=sum(len(c.outfits) for c in chunks))
+        log_fn("BodySlide: automatic build complete.")
     except Exception as exc:  # noqa: BLE001 - never block the launch
         log_fn(f"BodySlide: automatic build failed - {exc!r}")
         status("BodySlide: automatic build failed - see the log")
