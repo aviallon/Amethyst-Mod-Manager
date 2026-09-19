@@ -399,5 +399,43 @@ class BodySlideChunkTests(unittest.TestCase):
             bodyslide_linux.is_installed = saved
 
 
+    def test_ungrouped_outfits_are_chunked_too(self) -> None:
+        """Outfits in NO group must still be split by the budget.
+
+        Several packs (CBBE, for one) ship no slider groups at all, so lumping
+        everything else into one chunk would rebuild the unbounded batch this
+        module exists to avoid - and the first automatic run builds everything.
+        """
+        self._write_sets([("A", 5000), ("B", 5000), ("C", 5000)])
+        outfits = bodyslide_auto.discover_outfits(_ANY_GAME)
+        chunks = bodyslide_auto.plan_chunks({}, outfits, max_data_per_chunk=8000)
+
+        self.assertGreater(len(chunks), 1, "ungrouped outfits must be split")
+        for chunk in chunks:
+            self.assertLessEqual(chunk.data, 8000, f"{chunk.group} over budget")
+            self.assertTrue(chunk.temporary)
+        planned = sorted(n for c in chunks for n in c.outfits)
+        self.assertEqual(planned, ["A", "B", "C"])
+
+    def test_ensure_output_dir_reports_why_it_failed(self) -> None:
+        """A failure must carry a reason, not just return None.
+
+        Regression: a wrong-arity call to sanitize_output_name() raised, was
+        swallowed, and reported only "could not determine the output mod" - which
+        said nothing about what to fix.
+        """
+        class _BrokenGame:
+            def get_effective_mod_staging_path(self):
+                raise RuntimeError("no staging path")
+
+            def get_profile_root(self):
+                raise RuntimeError("no profile root")
+
+        path, reason = bodyslide_auto.ensure_output_dir(_BrokenGame(), "p")
+        self.assertIsNone(path)
+        self.assertTrue(reason, "the reason must be non-empty")
+        self.assertIn("staging", reason.lower(), reason)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
