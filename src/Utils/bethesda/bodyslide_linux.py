@@ -48,12 +48,17 @@ from typing import TYPE_CHECKING, Callable
 if TYPE_CHECKING:
     from Games.base_game import BaseGame
 
-GITHUB_API_URL = (
-    "https://api.github.com/repos/ChrisDKN/BodySlide-and-Outfit-Studio-Appimage"
-    "/releases/latest"
-)
-REPO_URL = "https://github.com/ChrisDKN/BodySlide-and-Outfit-Studio-Appimage"
-
+# Which Linux bundle to install. Anyone can publish their own from a fork of the
+# project (the appimage workflow is in-tree), so this is overridable - a fork
+# that carries a fix gets it to its users through the ordinary install path
+# instead of a hand-patched bundle, which the next update would overwrite.
+# Default: the fork that builds the fixed slider-data handling.
+_DEFAULT_BODYSLIDE_REPO = "aviallon/BodySlide-and-Outfit-Studio"
+_bodyslide_repo = os.environ.get("AMETHYST_BODYSLIDE_REPO", "").strip().strip("/")
+if not _bodyslide_repo or "/" not in _bodyslide_repo:
+    _bodyslide_repo = _DEFAULT_BODYSLIDE_REPO
+GITHUB_API_URL = f"https://api.github.com/repos/{_bodyslide_repo}/releases/latest"
+REPO_URL = f"https://github.com/{_bodyslide_repo}"
 # tool key → (display name, launcher basename, default output mod name)
 TOOLS: dict[str, tuple[str, str, str]] = {
     "bodyslide":    ("BodySlide", "BodySlide", "BodySlide_files"),
