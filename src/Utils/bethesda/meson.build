@@ -2,6 +2,7 @@ py.install_sources(
   '__init__.py',
   '_selftest.py',
   'acmos.py',
+  'bodyslide_auto.py',
   'bodyslide.py',
   'bodyslide_linux.py',
   'cao.py',
