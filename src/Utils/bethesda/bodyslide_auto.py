@@ -158,15 +158,39 @@ def discover_groups(game: "BaseGame") -> dict[str, list[str]]:
 # Planning
 # ---------------------------------------------------------------------------
 
+def _split_budget(names: list[str], cost: dict[str, int], budget: int,
+                  prefix: str) -> list[Chunk]:
+    """Greedy split of *names* into budget-sized synthetic chunks."""
+    chunks: list[Chunk] = []
+    bucket: list[str] = []
+    used = 0
+    part = 0
+    for name in names:
+        if bucket and used + cost.get(name, 0) > budget:
+            part += 1
+            chunks.append(Chunk(group=f"{prefix}_{part}", outfits=bucket,
+                                data=used, temporary=True))
+            bucket, used = [], 0
+        bucket.append(name)
+        used += cost.get(name, 0)
+    if bucket:
+        part += 1
+        chunks.append(Chunk(group=f"{prefix}_{part}", outfits=bucket,
+                            data=used, temporary=True))
+    return chunks
+
+
 def plan_chunks(groups: dict[str, list[str]], outfits: list[Outfit], *,
                 max_data_per_chunk: int = DEFAULT_MAX_DATA_PER_CHUNK,
                 ) -> list[Chunk]:
     """Turn groups into an ordered list of process invocations.
 
     A group at or under the budget becomes one chunk. A heavier group is split
-    into synthetic sub-groups (greedy, in outfit order) so no single process
-    exceeds the budget. Outfits in no group are collected into one final chunk
-    so nothing is silently skipped.
+    into synthetic sub-groups. Outfits in NO group are split by the same budget
+    rather than collected into one chunk: several packs (CBBE, for one) ship no
+    slider groups at all, so a single "everything else" chunk would recreate the
+    unbounded batch build this module exists to avoid - and the first automatic
+    run builds everything, groups or not.
     """
     cost = {o.name: o.data for o in outfits}
     grouped: set[str] = set()
@@ -180,28 +204,19 @@ def plan_chunks(groups: dict[str, list[str]], outfits: list[Outfit], *,
         total = sum(cost[m] for m in known)
         if total <= max_data_per_chunk:
             chunks.append(Chunk(group=name, outfits=known, data=total))
-            continue
-        # greedy split preserving the group's own ordering
-        bucket: list[str] = []
-        used = 0
-        part = 0
-        for member in known:
-            if bucket and used + cost[member] > max_data_per_chunk:
-                part += 1
-                chunks.append(Chunk(group=f"{CHUNK_PREFIX}{name}_{part}",
-                                    outfits=bucket, data=used, temporary=True))
-                bucket, used = [], 0
-            bucket.append(member)
-            used += cost[member]
-        if bucket:
-            part += 1
-            chunks.append(Chunk(group=f"{CHUNK_PREFIX}{name}_{part}",
-                                outfits=bucket, data=used, temporary=True))
+        else:
+            chunks.extend(_split_budget(known, cost, max_data_per_chunk,
+                                        f"{CHUNK_PREFIX}{name}"))
 
     loose = [o.name for o in outfits if o.name not in grouped]
     if loose:
-        chunks.append(Chunk(group=f"{CHUNK_PREFIX}ungrouped", outfits=loose,
-                            data=sum(cost[n] for n in loose), temporary=True))
+        total = sum(cost[n] for n in loose)
+        if total <= max_data_per_chunk:
+            chunks.append(Chunk(group=f"{CHUNK_PREFIX}ungrouped", outfits=loose,
+                                data=total, temporary=True))
+        else:
+            chunks.extend(_split_budget(loose, cost, max_data_per_chunk,
+                                        f"{CHUNK_PREFIX}ungrouped"))
     return chunks
 
 
@@ -425,32 +440,42 @@ def is_enabled(game: "BaseGame") -> bool:
         return True
 
 
-def ensure_output_dir(game: "BaseGame", profile: str) -> Path | None:
-    """The output-capture mod a build lands in, created if needed.
+def ensure_output_dir(game: "BaseGame", profile: str) -> tuple[Path | None, str]:
+    """(path, reason) for the output-capture mod a build lands in.
 
     Same destination the BodySlide wizard uses, so an automatic build and a
-    manual one write to the same mod instead of producing two.
+    manual one write to the same mod instead of producing two. Returns a reason
+    on failure rather than None alone: an earlier version swallowed a
+    TypeError from a wrong-arity call and reported only "could not determine the
+    output mod", which said nothing about what to fix.
     """
     try:
         from Utils.bethesda.bodyslide import ensure_output_mod, sanitize_output_name
         from Utils.bethesda.bodyslide_linux import TOOLS
-        name = sanitize_output_name(TOOLS["bodyslide"][2])
+        default = TOOLS["bodyslide"][2]
+        name = sanitize_output_name(default, default)
         ensure_output_mod(game, profile, name)
-        return game.get_effective_mod_staging_path() / name
-    except Exception:  # noqa: BLE001
-        return None
+        return game.get_effective_mod_staging_path() / name, ""
+    except Exception as exc:  # noqa: BLE001 - reported, never raised
+        return None, f"{exc!r}"
 
 
 def run_automatic(game: "BaseGame", profile: str,
-                  log_fn: Callable[[str], None] = _noop) -> None:
+                  log_fn: Callable[[str], None] = _noop,
+                  status_fn: "Callable[[str], None] | None" = None) -> None:
     """The whole transparent step: decide, build, record. Never raises.
 
     Called from the launch path immediately before the game starts. It must not
     be able to stop someone playing, so every failure is logged and swallowed -
     the worst case is a stale body, not a game that will not start.
+
+    *status_fn* receives short user-facing lines; the launch path wires it to the
+    play toast, because a step that can take minutes must not be invisible.
     """
+    status = status_fn or (lambda _msg: None)
     try:
         if not is_enabled(game):
+            log_fn("BodySlide: automatic build disabled in Launch settings.")
             return
         stale, why = is_stale(game, profile)
         if not stale:
@@ -458,24 +483,32 @@ def run_automatic(game: "BaseGame", profile: str,
             return
         log_fn(f"BodySlide: automatic build needed - {why}.")
 
+        output_dir, reason = ensure_output_dir(game, profile)
+        if output_dir is None:
+            log_fn(f"BodySlide: could not prepare the output mod - {reason}")
+            status("BodySlide: could not prepare its output mod; skipping")
+            return
+
         groups = discover_groups(game)
         outfits = discover_outfits(game)
-        output_dir = ensure_output_dir(game, profile)
-        if output_dir is None:
-            log_fn("BodySlide: could not determine the output mod; skipping.")
-            return
-        output_dir.mkdir(parents=True, exist_ok=True)
+        chunks = plan_chunks(groups, outfits)
+        log_fn(f"BodySlide: building {len(outfits)} outfits in {len(chunks)} "
+               f"chunk(s)…")
+        status(f"Building {len(outfits)} BodySlide outfits "
+               f"({len(chunks)} chunks)…")
 
+        output_dir.mkdir(parents=True, exist_ok=True)
         want = fingerprint(game, profile, groups, outfits)
         failures = run_chunked(game, profile, output_dir=output_dir,
                                log_fn=log_fn)
         if failures:
             log_fn(f"BodySlide: {failures} chunk(s) failed; not recording the "
                    "build so the next launch retries.")
+            status(f"BodySlide: {failures} chunk(s) failed - see the log")
             return
         write_stamp(game, profile, want,
-                    chunks=len(plan_chunks(groups, outfits)),
-                    built=len(outfits))
+                    chunks=len(chunks), built=len(outfits))
         log_fn(f"BodySlide: automatic build complete ({len(outfits)} outfits).")
     except Exception as exc:  # noqa: BLE001 - never block the launch
         log_fn(f"BodySlide: automatic build failed - {exc!r}")
+        status("BodySlide: automatic build failed - see the log")

@@ -12550,7 +12550,9 @@ class MainWindow(QMainWindow):
                 return
             bodyslide_auto.run_automatic(
                 game, profile,
-                log_fn=lambda line: self._append_log(f"[bodyslide] {line}"))
+                log_fn=lambda line: self._append_log(f"[bodyslide] {line}"),
+                # visible, not just logged: a chunked build can run for minutes
+                status_fn=self._set_play_toast)
         except Exception as exc:  # noqa: BLE001 - a launch must never be blocked
             self._append_log(f"[bodyslide] automatic build skipped: {exc!r}")
 

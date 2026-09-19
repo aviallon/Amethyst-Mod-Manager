@@ -38,6 +38,10 @@ class BodySlideLinuxView(WizardViewBase):
     _inst_progress_sig = Signal(int)
     _inst_latest_sig = Signal(object)     # (tag, url) | None
     _inst_done_sig = Signal(bool)
+    # Chunked build (see bodyslide_auto): its own status so the worker never
+    # touches a widget, matching how the install page reports progress.
+    _chunk_status_sig = Signal(str, str)
+    _chunk_done_sig = Signal()
 
     def __init__(self, game: "BaseGame", log_fn=None, on_close=None, ctx=None,
                  *, tool: str = "bodyslide", **_extra):
@@ -51,6 +55,10 @@ class BodySlideLinuxView(WizardViewBase):
 
         self._inst_status_sig.connect(self._guard(
             lambda t, c: self._set_status(self._inst_status, t, c)))
+        self._chunk_status_sig.connect(self._guard(
+            lambda t, c: self._set_status(self._deploy_status, t, c)))
+        self._chunk_done_sig.connect(self._guard(
+            lambda: self._chunk_btn.setEnabled(True)))
         self._inst_progress_sig.connect(self._guard(self._on_inst_progress))
         self._inst_latest_sig.connect(self._guard(self._on_latest))
         self._inst_done_sig.connect(self._guard(self._on_install_done))
@@ -256,6 +264,15 @@ class BodySlideLinuxView(WizardViewBase):
         self._deploy_skip_btn.setCursor(Qt.PointingHandCursor)
         self._deploy_skip_btn.clicked.connect(self._skip_deploy)
         bh.addWidget(self._deploy_skip_btn)
+        self._chunk_btn = QPushButton(self.tr("Chunked build (all outfits)"))
+        self._chunk_btn.setCursor(Qt.PointingHandCursor)
+        self._chunk_btn.setToolTip(self.tr(
+            "Build every outfit one slider group at a time. A single batch "
+            "build of a large load order can exhaust memory and be killed at "
+            "the very end of the build; each chunk here runs in its own "
+            "process, so a build that fails does not take the rest with it."))
+        self._chunk_btn.clicked.connect(self._start_chunked_build)
+        bh.addWidget(self._chunk_btn)
         self._deploy_btn = self._accent_btn(self.tr("Deploy"))
         self._deploy_btn.clicked.connect(self._start_bs_deploy)
         bh.addWidget(self._deploy_btn)
@@ -349,6 +366,66 @@ class BodySlideLinuxView(WizardViewBase):
 
         threading.Thread(target=worker, daemon=True,
                          name="bodyslide-linux-run").start()
+
+    def _start_chunked_build(self):
+        """Build every outfit in budget-sized chunks, driven from the wizard.
+
+        The same work as the automatic pre-launch step, but chosen by the user
+        and visible here: progress per chunk goes to the status line and the
+        log. Needs the deployed Data folder, which is why it sits on this page.
+        """
+        from Utils.bethesda import bodyslide_auto
+
+        game, profile = self._game, self._profile()
+        self._capture_output_mod_name()
+        self._chunk_btn.setEnabled(False)
+
+        def worker():
+            from wizards_qt import notify_wizard_output
+            try:
+                output_dir = (game.get_effective_mod_staging_path()
+                              / self._output_mod_name)
+                output_dir.mkdir(parents=True, exist_ok=True)
+                self._warn_if_no_slider_data(game)
+
+                outfits = bodyslide_auto.discover_outfits(game)
+                groups = bodyslide_auto.discover_groups(game)
+                chunks = bodyslide_auto.plan_chunks(groups, outfits)
+                if not outfits:
+                    safe_emit(self._chunk_status_sig,
+                              self.tr("No outfits found in the deployed "
+                                      "Data folder."), err_text())
+                    return
+                self._log_tool(
+                    f"chunked build: {len(outfits)} outfits, "
+                    f"{len(groups)} group(s), {len(chunks)} chunk(s)")
+                safe_emit(self._chunk_status_sig,
+                          self.tr("Building {0} outfits in {1} chunk(s)…")
+                          .format(len(outfits), len(chunks)), "")
+
+                failures = bodyslide_auto.run_chunked(
+                    game, profile, output_dir=output_dir,
+                    log_fn=self._log_tool)
+                if failures:
+                    safe_emit(self._chunk_status_sig,
+                              self.tr("{0} chunk(s) failed - see the log")
+                              .format(failures), err_text())
+                    return
+                notify_wizard_output(self._ctx, "BodySlide wrote output",
+                                     self._log_tool)
+                safe_emit(self._chunk_status_sig,
+                          self.tr("Built {0} outfits in {1} chunk(s).")
+                          .format(len(outfits), len(chunks)), ok_text())
+            except Exception as exc:
+                safe_emit(self._chunk_status_sig,
+                          self.tr("Chunked build error: {0}").format(exc),
+                          err_text())
+                self._log_tool(f"chunked build error: {exc}")
+            finally:
+                safe_emit(self._chunk_done_sig)
+
+        threading.Thread(target=worker, daemon=True,
+                         name="bodyslide-linux-chunked").start()
 
     def _warn_if_no_slider_data(self, game):
         """Log when the deployed slider data isn't where the tool looks.
