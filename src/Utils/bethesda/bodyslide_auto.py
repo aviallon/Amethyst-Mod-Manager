@@ -342,12 +342,17 @@ def write_stamp(game: "BaseGame", profile: str, fingerprint_value: str,
 def run_chunked(game: "BaseGame", profile: str, *, output_dir: Path,
                 log_fn: Callable[[str], None] = _noop,
                 max_data_per_chunk: int = DEFAULT_MAX_DATA_PER_CHUNK,
-                trimorphs: bool | None = None) -> int:
+                trimorphs: bool = True) -> int:
     """Build every group, one process per chunk. Returns the number of failures.
 
     Never raises for a single chunk failing: a build that dies on chunk 7 of 12
     must still report 1..6 as done, and the caller can retry cheaply because
     the stamp is only written when everything succeeded.
+
+    *trimorphs* defaults to True because a command-line build does NOT write
+    morph output unless asked, and without it every built body would silently
+    lose its BodyMorph sliders - a worse outcome than the memory it costs, now
+    that each process is bounded.
     """
     from Utils.bethesda.bodyslide_linux import build_env, run_logged
 
@@ -388,3 +393,89 @@ def run_chunked(game: "BaseGame", profile: str, *, output_dir: Path,
             except OSError as exc:
                 log_fn(f"BodySlide: could not remove {path.name}: {exc}")
     return failures
+
+
+# ---------------------------------------------------------------------------
+# Launch integration - one call, so the Qt side needs no logic of its own
+# ---------------------------------------------------------------------------
+
+# Key for the Launch-settings checkbox declared by the Skyrim handler. Stored
+# per game by Utils/executables/launch.py; absent means enabled, matching the
+# "it should just work unless I turn it off" intent.
+TOGGLE_KEY = "bodyslide_auto"
+
+
+def is_enabled(game: "BaseGame") -> bool:
+    """Whether automatic builds are on for *game*.
+
+    Off unless the user turned it off is the wrong way round for a toggle that
+    defaults to on, so any failure to read the setting leaves it enabled only
+    when the tool is actually installed.
+    """
+    try:
+        from Utils.bethesda.bodyslide_linux import is_installed
+        if not is_installed():
+            return False
+    except Exception:  # noqa: BLE001
+        return False
+    try:
+        from Utils.executables import launch as exe_launch
+        return bool(exe_launch.load_launch_toggle(game, TOGGLE_KEY, True))
+    except Exception:  # noqa: BLE001 - an unreadable setting must not block play
+        return True
+
+
+def ensure_output_dir(game: "BaseGame", profile: str) -> Path | None:
+    """The output-capture mod a build lands in, created if needed.
+
+    Same destination the BodySlide wizard uses, so an automatic build and a
+    manual one write to the same mod instead of producing two.
+    """
+    try:
+        from Utils.bethesda.bodyslide import ensure_output_mod, sanitize_output_name
+        from Utils.bethesda.bodyslide_linux import TOOLS
+        name = sanitize_output_name(TOOLS["bodyslide"][2])
+        ensure_output_mod(game, profile, name)
+        return game.get_effective_mod_staging_path() / name
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def run_automatic(game: "BaseGame", profile: str,
+                  log_fn: Callable[[str], None] = _noop) -> None:
+    """The whole transparent step: decide, build, record. Never raises.
+
+    Called from the launch path immediately before the game starts. It must not
+    be able to stop someone playing, so every failure is logged and swallowed -
+    the worst case is a stale body, not a game that will not start.
+    """
+    try:
+        if not is_enabled(game):
+            return
+        stale, why = is_stale(game, profile)
+        if not stale:
+            log_fn(f"BodySlide: automatic build skipped - {why}.")
+            return
+        log_fn(f"BodySlide: automatic build needed - {why}.")
+
+        groups = discover_groups(game)
+        outfits = discover_outfits(game)
+        output_dir = ensure_output_dir(game, profile)
+        if output_dir is None:
+            log_fn("BodySlide: could not determine the output mod; skipping.")
+            return
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        want = fingerprint(game, profile, groups, outfits)
+        failures = run_chunked(game, profile, output_dir=output_dir,
+                               log_fn=log_fn)
+        if failures:
+            log_fn(f"BodySlide: {failures} chunk(s) failed; not recording the "
+                   "build so the next launch retries.")
+            return
+        write_stamp(game, profile, want,
+                    chunks=len(plan_chunks(groups, outfits)),
+                    built=len(outfits))
+        log_fn(f"BodySlide: automatic build complete ({len(outfits)} outfits).")
+    except Exception as exc:  # noqa: BLE001 - never block the launch
+        log_fn(f"BodySlide: automatic build failed - {exc!r}")
