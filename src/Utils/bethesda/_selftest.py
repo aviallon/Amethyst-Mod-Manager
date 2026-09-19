@@ -357,6 +357,47 @@ class BodySlideChunkTests(unittest.TestCase):
                                            bodyslide_auto.discover_outfits(game))
         self.assertNotEqual(before, after, "changed slider data must invalidate")
 
+    # -- the launch-hook contract -----------------------------------------
+
+    def test_run_automatic_never_raises(self) -> None:
+        """A broken automatic step must not stop the game launching."""
+        logs: list[str] = []
+        saved, saved_enabled = bodyslide_auto.is_stale, bodyslide_auto.is_enabled
+        try:
+            bodyslide_auto.is_enabled = lambda *_a, **_k: True
+            bodyslide_auto.is_stale = lambda *_a, **_k: (_ for _ in ()).throw(
+                RuntimeError("boom"))
+            bodyslide_auto.run_automatic(_ANY_GAME, "p", log_fn=logs.append)
+        finally:
+            bodyslide_auto.is_stale, bodyslide_auto.is_enabled = saved, saved_enabled
+        self.assertTrue(any("failed" in m for m in logs), logs)
+
+    def test_run_automatic_skips_when_up_to_date(self) -> None:
+        """An unchanged profile must not pay for a rebuild on every launch."""
+        logs: list[str] = []
+        called: list[int] = []
+        saved = (bodyslide_auto.is_stale, bodyslide_auto.is_enabled,
+                 bodyslide_auto.run_chunked)
+        try:
+            bodyslide_auto.is_enabled = lambda *_a, **_k: True
+            bodyslide_auto.is_stale = lambda *_a, **_k: (False, "up to date")
+            bodyslide_auto.run_chunked = lambda *_a, **_k: called.append(1) or 0
+            bodyslide_auto.run_automatic(_ANY_GAME, "p", log_fn=logs.append)
+        finally:
+            (bodyslide_auto.is_stale, bodyslide_auto.is_enabled,
+             bodyslide_auto.run_chunked) = saved
+        self.assertEqual(called, [], "an up-to-date profile must not rebuild")
+        self.assertTrue(any("skipped" in m for m in logs), logs)
+
+    def test_is_enabled_needs_the_tool_installed(self) -> None:
+        from Utils.bethesda import bodyslide_linux
+        saved = bodyslide_linux.is_installed
+        try:
+            bodyslide_linux.is_installed = lambda: False
+            self.assertFalse(bodyslide_auto.is_enabled(_ANY_GAME))
+        finally:
+            bodyslide_linux.is_installed = saved
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

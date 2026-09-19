@@ -12428,6 +12428,7 @@ class MainWindow(QMainWindow):
                 session = self._new_play_session(label)
 
                 def _run(run_path=run_path, session=session):
+                    self._maybe_autobuild_bodyslide(game)
                     # Worker-thread exceptions otherwise vanish to stderr, and
                     # most launch paths fail by logging and returning - the
                     # report catches both, plus a process that dies instantly.
@@ -12492,6 +12493,7 @@ class MainWindow(QMainWindow):
             session = self._new_play_session(game.name)
 
             def _run(session=session):
+                self._maybe_autobuild_bodyslide(game)
                 # Worker-thread exceptions otherwise vanish to stderr, and most
                 # launch paths fail by logging and returning - the report
                 # catches both, plus a process that dies instantly.
@@ -12529,6 +12531,28 @@ class MainWindow(QMainWindow):
             self._on_deploy()
         else:
             _launch()
+
+    def _maybe_autobuild_bodyslide(self, game) -> None:
+        """Run the automatic BodySlide step before a launch, if the game has one.
+
+        Deliberately called from the launch WORKER (never the UI thread) and
+        after any deploy has finished, because the tool reads slider data out of
+        the deployed Data folder. Utils.bethesda.bodyslide_auto swallows its own
+        failures; this wrapper exists so that even a bug in the toggle lookup
+        cannot stop someone playing.
+        """
+        profile = getattr(self._gs, "profile", None)
+        if not profile:
+            return
+        try:
+            from Utils.bethesda import bodyslide_auto
+            if not bodyslide_auto.is_enabled(game):
+                return
+            bodyslide_auto.run_automatic(
+                game, profile,
+                log_fn=lambda line: self._append_log(f"[bodyslide] {line}"))
+        except Exception as exc:  # noqa: BLE001 - a launch must never be blocked
+            self._append_log(f"[bodyslide] automatic build skipped: {exc!r}")
 
     def _on_play_action(self, which):
         game = self._gs.game

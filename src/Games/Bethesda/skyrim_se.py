@@ -11,7 +11,7 @@ from pathlib import Path
 
 from Games.Bethesda.fallout_3 import Fallout_3
 from Games.Bethesda.skyrim_common import SKYRIM_MOD_REQUIRED_TOP_LEVEL_FOLDERS
-from Games.base_game import WizardTool, MODERN_DIRECTX_DEPS
+from Games.base_game import LaunchToggle, WizardTool, MODERN_DIRECTX_DEPS
 
 
 class SkyrimSE(Fallout_3):
@@ -57,6 +57,29 @@ class SkyrimSE(Fallout_3):
         "_ResourcePack.esl",
     ]
     synthesis_registry_name = "Skyrim Special Edition"
+
+    # -----------------------------------------------------------------------
+    # Launch settings
+    # -----------------------------------------------------------------------
+    #
+    # BodySlide has no way to build "everything" without doing it in one process,
+    # and one process with a large load order grows to tens of GB of anonymous
+    # memory until the kernel's OOM killer ends it at the very end of the build
+    # (observed: 32.2 GB anon-rss, "Out of memory: Killed process (BodySlide)").
+    # Amethyst runs the tool's own CLI once per slider group before launching, so
+    # each build starts from a clean process, and only when the inputs actually
+    # changed. This toggle is the escape hatch for people who build by hand.
+    @property
+    def launch_toggles(self) -> list[LaunchToggle]:
+        return [LaunchToggle(
+            key="bodyslide_auto",
+            label="Build BodySlide outfits automatically before launching",
+            hint=("Runs BodySlide once per slider group, instead of one huge "
+                  "batch build that can exhaust memory. Only runs when the "
+                  "outfits, groups or tool have changed since the last build. "
+                  "Off: build manually from the BodySlide wizard as before."),
+            default=True,
+        )]
 
     # -----------------------------------------------------------------------
     # Identity
