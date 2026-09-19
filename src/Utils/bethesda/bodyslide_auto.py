@@ -50,12 +50,26 @@ CHUNK_PREFIX = "ZZAutoChunk_"
 # (CBBE's whole 492-outfit set is ~39k and builds fine on its own).
 DEFAULT_MAX_DATA_PER_CHUNK = 8000
 
-# Outfits per chunk. This, not the data budget, is what actually bounds memory:
-# measured on one load order, chunks with ~8000 data entries and 87 outfits took
-# 15s and lived, while a 210-outfit chunk of COMPARABLE data volume reached
-# 32.7 GB and was OOM-killed (~150 MB per outfit, each loading its own source
-# mesh and OSD data). Chunks are split on whichever budget trips first.
+# Outfits per chunk. Both budgets are crude proxies for what BodySlide is
+# actually about to allocate, and neither predicts the worst case: measured on
+# one load order, 48 outfits / 3497 data entries ran 128s and was OOM-killed at
+# 32.7 GB, while a different 48-outfit / 1176-entry chunk finished in 2s. The
+# cost is a property of the INDIVIDUAL outfit (which mesh and which slider data
+# it pulls in), so chunk size can only reduce how often the worst case is hit -
+# the watchdog and the bisect below are what make it survive.
 DEFAULT_MAX_OUTFITS_PER_CHUNK = 48
+
+# Ceiling on one chunk process, enforced by polling its process tree (see
+# bodyslide_linux.run_logged). Set well under the machine's RAM so the kernel's
+# OOM killer never gets to make the choice, which on this workload also takes
+# the desktop's responsiveness with it. A healthy chunk stays in the hundreds
+# of MB, so this only ever fires on the pathological case.
+DEFAULT_MAX_RSS_MB = 8000
+
+# And a wall-clock ceiling, because "very slow" and "about to run out of
+# memory" are the same failure from the outside, and a hung chunk would
+# otherwise stall a launch forever.
+DEFAULT_CHUNK_TIMEOUT_S = 300
 
 _STAMP_NAME = "BodySlide_auto_stamp.json"
 
@@ -272,6 +286,42 @@ _HINT_TOKENS: tuple[tuple[str, tuple[str, ...]], ...] = (
                     "males", "females")),
     ("physics", ("physics", "hdt", "smp")),
 )
+
+
+def isolate_failures(run_fn: Callable[[str, list[str]], int],
+                     members: list[str], *,
+                     log_fn: Callable[[str], None] = _noop,
+                     tag: str = "retry") -> list[str]:
+    """Run *members* as one group; on failure, halve and retry.
+
+    Returns the outfits that failed even when built alone. *run_fn* takes
+    ``(group_name, member_names)`` and returns the exit code.
+
+    Why bisect rather than just report the chunk: a chunk that dies tells you
+    nothing about which of its 48 outfits did it, and the failure is a property
+    of one outfit, so the halves quickly name it. A single outfit that fails on
+    its own is then skipped by name instead of costing the other 47 their build.
+    """
+    def attempt(names: list[str]) -> int:
+        group = f"{CHUNK_PREFIX}{tag}_{len(names)}"
+        return run_fn(group, names)
+
+    rc = attempt(members)
+    if rc == 0:
+        return []
+    if len(members) == 1:
+        log_fn(f"BodySlide: '{members[0]}' failed on its own (code {rc}) - "
+               f"skipping it; every other outfit in that chunk still built.")
+        return list(members)
+
+    mid = len(members) // 2
+    log_fn(f"BodySlide: {len(members)} outfits failed together (code {rc}) - "
+           f"splitting into {mid} and {len(members) - mid} to find the culprit.")
+    failed = isolate_failures(run_fn, members[:mid], log_fn=log_fn,
+                              tag=f"{tag}a")
+    failed += isolate_failures(run_fn, members[mid:], log_fn=log_fn,
+                               tag=f"{tag}b")
+    return failed
 
 
 def _hint_for(names: list[str]) -> str:
@@ -559,19 +609,28 @@ def run_chunked(game: "BaseGame", profile: str, *, output_dir: Path,
                 log_fn: Callable[[str], None] = _noop,
                 max_data_per_chunk: int = DEFAULT_MAX_DATA_PER_CHUNK,
                 max_outfits_per_chunk: int = DEFAULT_MAX_OUTFITS_PER_CHUNK,
+                max_rss_mb: float = DEFAULT_MAX_RSS_MB,
+                timeout_s: float = DEFAULT_CHUNK_TIMEOUT_S,
                 trimorphs: bool = True) -> int:
-    """Build every chosen group, one process per chunk. Returns failures.
+    """Build every chosen group, one process per chunk. Returns unbuildable outfits.
 
     Never raises for a single chunk failing: a build that dies on chunk 7 of 12
-    must still report 1..6 as done, and the caller can retry cheaply because
-    the stamp is only written when everything succeeded.
+    must still report 1..6 as done. The return value is the number of OUTFITS
+    that could not be built even after being isolated - 0 means everything
+    built, and anything else means a specific, named outfit needs attention.
+
+    *max_rss_mb* / *timeout_s* are ceilings on ONE chunk process, passed to
+    run_logged. They exist because chunk size cannot bound the worst case: an
+    outfit can ask for tens of GB on its own, and letting the kernel's OOM
+    killer decide takes the whole desktop down with it.
 
     *trimorphs* defaults to True because a command-line build does NOT write
     morph output unless asked, and without it every built body would silently
     lose its BodyMorph sliders - a worse outcome than the memory it costs, now
     that each process is bounded.
     """
-    from Utils.bethesda.bodyslide_linux import build_env, run_logged
+    from Utils.bethesda.bodyslide_linux import (EXIT_MEMORY_GUARD, EXIT_TIMEOUT,
+                                               build_env, run_logged)
 
     groups = discover_groups(game)
     outfits = discover_outfits(game)
@@ -602,7 +661,7 @@ def run_chunked(game: "BaseGame", profile: str, *, output_dir: Path,
         log_fn(f"BodySlide: removed {cleared} leftover chunk group(s).")
     written = write_chunk_groups(game, chunks, log_fn=log_fn)
 
-    failures = 0
+    failed_names: list[str] = []
     total_data = sum(c.data for c in chunks)
     total_outfits = sum(len(c.outfits) for c in chunks)
     env = build_env(game, profile, output_dir, log_fn=log_fn)
@@ -610,16 +669,61 @@ def run_chunked(game: "BaseGame", profile: str, *, output_dir: Path,
            f"{total_data} slider-data entries "
            f"(caps {max_outfits_per_chunk} outfits / {max_data_per_chunk} data).")
     try:
+        # Groups that already have a file on disk from write_chunk_groups above;
+        # anything else is a retry group that has to be written as we go.
+        prepared = {c.group for c in chunks}
+
         for index, chunk in enumerate(chunks, 1):
-            args = [f"--groupbuild={chunk.group}", f"--targetdir={output_dir}"]
-            if trimorphs:
-                args.append("--trimorphs")
+            def run_chunk(group: str, members: list[str]) -> int:
+                args = [f"--groupbuild={group}", f"--targetdir={output_dir}"]
+                if trimorphs:
+                    args.append("--trimorphs")
+                wrote: Path | None = None
+                if group not in prepared:
+                    made = write_chunk_groups(
+                        game,
+                        [Chunk(group=group, outfits=list(members), data=0,
+                               temporary=True)],
+                        log_fn=_noop)
+                    wrote = made[0] if made else None
+                    if wrote is None:
+                        log_fn(f"BodySlide: could not create a group for "
+                               f"{len(members)} outfit(s) - skipping.")
+                        return 1
+                try:
+                    return run_logged("BodySlide", env, args=args, log_fn=log_fn,
+                                      label=f"BodySlide[{index}/{len(chunks)}]",
+                                      max_rss_mb=max_rss_mb, timeout_s=timeout_s)
+                finally:
+                    if wrote is not None:
+                        try:
+                            os.unlink(wrote)
+                        except OSError as exc:
+                            log_fn(f"BodySlide: could not remove {wrote.name}: {exc}")
+
             log_fn(f"BodySlide: chunk {index}/{len(chunks)} - {chunk.label}")
-            rc = run_logged("BodySlide", env, args=args, log_fn=log_fn,
-                            label=f"BodySlide[{index}/{len(chunks)}]")
-            if rc != 0:
-                failures += 1
+            try:
+                rc = run_chunk(chunk.group, list(chunk.outfits))
+            except KeyboardInterrupt:
+                raise
+            except Exception as exc:  # noqa: BLE001 - one chunk must not end the run
+                log_fn(f"BodySlide: chunk {index} could not run - {exc}")
+                failed_names.extend(chunk.outfits)
+                continue
+            if rc == 0:
+                continue
+            if rc in (-9, EXIT_MEMORY_GUARD):
+                log_fn(f"BodySlide: chunk {index} ran out of memory (code {rc}).")
+            elif rc == EXIT_TIMEOUT:
+                log_fn(f"BodySlide: chunk {index} hit the {timeout_s:.0f}s limit.")
+            else:
                 log_fn(f"BodySlide: chunk {index} failed with code {rc}.")
+            failed = isolate_failures(run_chunk, list(chunk.outfits),
+                                      log_fn=log_fn, tag=f"retry{index}")
+            if failed:
+                failed_names.extend(failed)
+                log_fn(f"BodySlide: gave up on {len(failed)} outfit(s) after "
+                       f"isolating them: {', '.join(sorted(failed))}")
     finally:
         # always, including on KeyboardInterrupt: a leftover chunk group would
         # otherwise be read back as a real group on the next run
@@ -628,7 +732,14 @@ def run_chunked(game: "BaseGame", profile: str, *, output_dir: Path,
                 os.unlink(path)
             except OSError as exc:
                 log_fn(f"BodySlide: could not remove {path.name}: {exc}")
-    return failures
+    unbuildable = sorted(set(failed_names))
+    if unbuildable:
+        log_fn(f"BodySlide: {len(unbuildable)} outfit(s) could not be built - "
+               f"everything else did: {', '.join(unbuildable)}")
+    # Counts OUTFITS, not chunks: after a bisect a chunk failure is no longer a
+    # unit, and the caller needs to know whether anything was left unbuilt
+    # rather than how many processes it took to find out.
+    return len(unbuildable)
 
 
 # ---------------------------------------------------------------------------
@@ -722,16 +833,24 @@ def run_automatic(game: "BaseGame", profile: str,
 
         output_dir.mkdir(parents=True, exist_ok=True)
         want = _fingerprint_inputs(game, profile, groups, outfits)
-        failures = run_chunked(game, profile, output_dir=output_dir,
-                               log_fn=log_fn)
-        if failures:
-            log_fn(f"BodySlide: {failures} chunk(s) failed; not recording the "
-                   "build so the next launch retries.")
-            status(f"BodySlide: {failures} chunk(s) failed - see the log")
+        total = sum(len(c.outfits) for c in chunks)
+        unbuildable = run_chunked(game, profile, output_dir=output_dir,
+                                  log_fn=log_fn)
+        if unbuildable and unbuildable >= total:
+            log_fn(f"BodySlide: nothing built ({unbuildable} outfit(s) failed); "
+                   "not recording the build so the next launch retries.")
+            status("BodySlide: the build failed - see the log")
             return
+        if unbuildable:
+            # Recorded anyway: retrying the whole build forever because one
+            # outfit cannot be built on this machine would mean rebuilding
+            # everything the user's machine CAN build on every single launch.
+            log_fn(f"BodySlide: recording the build, but {unbuildable} "
+                   "outfit(s) could not be built - named above.")
+            status(f"BodySlide: built, {unbuildable} outfit(s) failed")
         write_stamp(game, profile, want,
                     chunks=len(chunks),
-                    built=sum(len(c.outfits) for c in chunks))
+                    built=total - unbuildable)
         log_fn("BodySlide: automatic build complete.")
     except Exception as exc:  # noqa: BLE001 - never block the launch
         log_fn(f"BodySlide: automatic build failed - {exc!r}")
