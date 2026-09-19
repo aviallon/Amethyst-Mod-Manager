@@ -13,7 +13,7 @@ import unittest
 import zlib
 from pathlib import Path
 
-from Utils.bethesda import xedit
+from Utils.bethesda import bodyslide_auto, xedit
 from Utils.filegraph import staleness
 
 
@@ -224,6 +224,138 @@ class StagingDirtyMarkerTests(unittest.TestCase):
             staleness.mark_staging_dirty(profile, "second")
             self.assertEqual(
                 staleness.staging_dirty_reason(profile), "second")
+
+
+_ANY_GAME = object()   # bodyslide_dir() is patched in these tests
+
+
+class BodySlideChunkTests(unittest.TestCase):
+    """Chunk planning, discovery and the temporary-group lifecycle.
+
+    The load-bearing invariant is that chunking never silently drops an outfit: a
+    dropped outfit means a body built wrong, with no error anywhere.
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        # the module reads the DEPLOYED tree; point it at a scratch one
+        self._saved = bodyslide_auto.bodyslide_dir
+        bodyslide_auto.bodyslide_dir = lambda _game: self.deployed  # type: ignore[assignment]
+        self.deployed = self.root / "CalienteTools" / "BodySlide"
+        (self.deployed / "SliderSets").mkdir(parents=True)
+        (self.deployed / "SliderGroups").mkdir(parents=True)
+
+    def tearDown(self) -> None:
+        bodyslide_auto.bodyslide_dir = self._saved  # type: ignore[assignment]
+        self._tmp.cleanup()
+
+    def _set(self, name: str, data: int) -> None:
+        body = "\n".join(f'<Data name="{name}_{i}"/>' for i in range(data))
+        (self.deployed / "SliderSets" / "t.osp").write_text(
+            f'<SliderSetInfo><SliderSet name="{name}">{body}</SliderSet></SliderSetInfo>',
+            encoding="utf-8")
+
+    def _group(self, name: str, members: list[str]) -> None:
+        body = "\n".join(f'<Member name="{m}"/>' for m in members)
+        (self.deployed / "SliderGroups" / f"{name}.xml").write_text(
+            f'<SliderGroups><Group name="{name}">{body}</Group></SliderGroups>',
+            encoding="utf-8")
+
+    def _write_sets(self, specs: list[tuple[str, int]]) -> None:
+        parts = []
+        for name, data in specs:
+            body = "".join(f'<Data name="{name}_{i}"/>' for i in range(data))
+            parts.append(f'<SliderSet name="{name}">{body}</SliderSet>')
+        (self.deployed / "SliderSets" / "a.osp").write_text(
+            "<SliderSetInfo>" + "".join(parts) + "</SliderSetInfo>",
+            encoding="utf-8")
+
+    def test_discovery_reads_sets_and_groups(self) -> None:
+        self._write_sets([("Alpha", 3), ("Beta", 5)])
+        self._group("G", ["Alpha", "Beta"])
+        outfits = bodyslide_auto.discover_outfits(_ANY_GAME)
+        self.assertEqual([o.name for o in outfits], ["Alpha", "Beta"])
+        self.assertEqual({o.name: o.data for o in outfits}, {"Alpha": 3, "Beta": 5})
+        self.assertEqual(bodyslide_auto.discover_groups(_ANY_GAME), {"G": ["Alpha", "Beta"]})
+
+    def test_discovery_dedupes_the_same_outfit(self) -> None:
+        self._write_sets([("Alpha", 4)])
+        (self.deployed / "ConversionSets").mkdir()
+        (self.deployed / "ConversionSets" / "b.osp").write_text(
+            '<SliderSetInfo><SliderSet name="Alpha"><Data name="x"/></SliderSet></SliderSetInfo>',
+            encoding="utf-8")
+        outfits = bodyslide_auto.discover_outfits(_ANY_GAME)
+        self.assertEqual(len(outfits), 1, "a duplicate outfit must not be counted twice")
+
+    def test_chunking_never_drops_an_outfit(self) -> None:
+        specs = [("A", 5000), ("B", 5000), ("C", 5000), ("D", 10)]
+        self._write_sets(specs)
+        self._group("Heavy", ["A", "B", "C"])     # 15000 > budget -> split
+        self._group("Light", ["D"])
+        outfits = bodyslide_auto.discover_outfits(_ANY_GAME)
+        chunks = bodyslide_auto.plan_chunks(
+            bodyslide_auto.discover_groups(_ANY_GAME), outfits,
+            max_data_per_chunk=8000)
+
+        planned = [n for c in chunks for n in c.outfits]
+        self.assertEqual(sorted(planned), ["A", "B", "C", "D"])
+        self.assertEqual(len(planned), len(set(planned)), "no outfit twice")
+        for chunk in chunks:
+            self.assertLessEqual(chunk.data, 8000, f"{chunk.group} over budget")
+        self.assertTrue(any(c.temporary for c in chunks), "heavy group must be split")
+
+    def test_chunking_collects_ungrouped_outfits(self) -> None:
+        self._write_sets([("A", 1), ("Orphan", 1)])
+        self._group("G", ["A"])
+        chunks = bodyslide_auto.plan_chunks(
+            bodyslide_auto.discover_groups(_ANY_GAME),
+            bodyslide_auto.discover_outfits(_ANY_GAME))
+        planned = sorted(n for c in chunks for n in c.outfits)
+        self.assertEqual(planned, ["A", "Orphan"],
+                         "an outfit in no group must still be built")
+
+    def test_chunk_files_are_written_then_cleared(self) -> None:
+        self._write_sets([("A", 9000), ("B", 9000)])
+        self._group("Heavy", ["A", "B"])
+        chunks = bodyslide_auto.plan_chunks(
+            bodyslide_auto.discover_groups(_ANY_GAME),
+            bodyslide_auto.discover_outfits(_ANY_GAME),
+            max_data_per_chunk=8000)
+
+        written = bodyslide_auto.write_chunk_groups(_ANY_GAME, chunks)
+        self.assertTrue(written, "split chunks need synthetic group files")
+        for path in written:
+            self.assertTrue(path.exists())
+
+        # a leftover from a crashed run must be swept, not read back as a group
+        leftover = self.deployed / "SliderGroups" / f"{bodyslide_auto.CHUNK_PREFIX}old.xml"
+        leftover.write_text("<SliderGroups/>", encoding="utf-8")
+        removed = bodyslide_auto.clear_chunk_groups(_ANY_GAME)
+        self.assertEqual(removed, len(written) + 1)
+        self.assertFalse(leftover.exists())
+        self.assertFalse(any(p.exists() for p in written))
+
+    def test_synthetic_chunk_groups_are_not_discovered_as_groups(self) -> None:
+        self._write_sets([("A", 1)])
+        self._group("Real", ["A"])
+        (self.deployed / "SliderGroups" / f"{bodyslide_auto.CHUNK_PREFIX}stale.xml").write_text(
+            f'<SliderGroups><Group name="{bodyslide_auto.CHUNK_PREFIX}stale">'
+            '<Member name="A"/></Group></SliderGroups>', encoding="utf-8")
+        self.assertEqual(list(bodyslide_auto.discover_groups(_ANY_GAME)), ["Real"])
+
+    def test_fingerprint_changes_when_an_input_changes(self) -> None:
+        self._write_sets([("A", 1)])
+        self._group("G", ["A"])
+        game = _ANY_GAME
+        groups, outfits = bodyslide_auto.discover_groups(game), bodyslide_auto.discover_outfits(game)
+        before = bodyslide_auto.fingerprint(game, "p", groups, outfits)
+        self.assertEqual(before, bodyslide_auto.fingerprint(game, "p", groups, outfits))
+
+        self._write_sets([("A", 2)])          # slider data changed
+        after = bodyslide_auto.fingerprint(game, "p", groups,
+                                           bodyslide_auto.discover_outfits(game))
+        self.assertNotEqual(before, after, "changed slider data must invalidate")
 
 
 if __name__ == "__main__":

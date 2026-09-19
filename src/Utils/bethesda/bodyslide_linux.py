@@ -331,8 +331,14 @@ _GTK_NOISE = re.compile(r"\b(Gtk|Gdk|GLib|GLib-GObject)-(WARNING|Message|CRITICA
 
 def run_logged(program: str, env: dict, *,
                log_fn: Callable[[str], None] = _noop,
-               label: str = "BodySlide") -> int:
+               label: str = "BodySlide",
+               args: "list[str] | None" = None) -> int:
     """Run the tarball launcher for *program*, streaming output to *log_fn*.
+
+    *args* are extra command-line arguments; with none the program starts
+    normally (its GUI). The tool's CLI supports only --groupbuild/--targetdir/
+    --preset/--trimorphs/--preview, so --groupbuild is how an unattended build
+    is requested - see Utils/bethesda/bodyslide_auto.py.
 
     Blocks until the tool exits - call from a worker thread. No flatpak-spawn
     hop: the bundle carries its own loader and libc, so it runs inside our
@@ -341,11 +347,12 @@ def run_logged(program: str, env: dict, *,
     launcher = launcher_path(program)
     home = os.path.expanduser("~")
     cwd = home if os.path.isdir(home) else "/"
+    argv = [str(launcher), *(args or [])]
 
-    log_fn(f"{label}: launching {launcher}")
+    log_fn(f"{label}: launching {' '.join(argv)}")
     try:
         proc = subprocess.Popen(
-            [str(launcher)],
+            argv,
             env=env,
             cwd=cwd,
             stdout=subprocess.PIPE,
