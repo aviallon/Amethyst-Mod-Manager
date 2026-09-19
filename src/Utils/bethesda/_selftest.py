@@ -437,5 +437,116 @@ class BodySlideChunkTests(unittest.TestCase):
         self.assertIn("staging", reason.lower(), reason)
 
 
+    def test_alternatives_detected_by_member_overlap(self) -> None:
+        """Same outfits under two group names = one choice, not two builds."""
+        self._write_sets([("A", 1), ("B", 1), ("C", 1), ("D", 1)])
+        self._group("CBBE", ["A", "B", "C"])
+        self._group("3BA", ["A", "B", "C"])
+        self._group("Unrelated", ["D"])
+        groups = bodyslide_auto.discover_groups(_ANY_GAME)
+        outfits = bodyslide_auto.discover_outfits(_ANY_GAME)
+
+        alts = bodyslide_auto.detect_alternatives(groups, outfits)
+        self.assertEqual(len(alts), 1, alts)
+        self.assertEqual(alts[0].groups, ["3BA", "CBBE"])
+
+        # default: build the first, skip the sibling
+        skip = bodyslide_auto.skipped_groups(alts, {})
+        self.assertEqual(skip, {"CBBE"})
+        # the user's stored choice wins
+        self.assertEqual(bodyslide_auto.skipped_groups(alts, {alts[0].key: "CBBE"}),
+                         {"3BA"})
+
+    def test_skipped_alternative_outfits_are_not_built(self) -> None:
+        self._write_sets([("A", 1), ("B", 1), ("C", 1)])
+        self._group("CBBE", ["A", "B"])
+        self._group("3BA", ["A", "B"])
+        groups = bodyslide_auto.discover_groups(_ANY_GAME)
+        outfits = bodyslide_auto.discover_outfits(_ANY_GAME)
+        alts = bodyslide_auto.detect_alternatives(groups, outfits)
+        skip = bodyslide_auto.skipped_groups(alts, {alts[0].key: "CBBE"})
+
+        chunks = bodyslide_auto.plan_chunks(groups, outfits, skip_groups=skip)
+        built = [n for c in chunks for n in c.outfits]
+        self.assertEqual(sorted(built), ["A", "B", "C"], "C is ungrouped, must remain")
+        self.assertEqual([c.group for c in chunks if c.group == "CBBE"], ["CBBE"])
+        self.assertNotIn("3BA", [c.group for c in chunks])
+
+    def test_outfit_count_caps_a_chunk(self) -> None:
+        """Memory tracks outfit count (measured), so it must bound chunks too."""
+        self._write_sets([(f"O{i}", 1) for i in range(25)])
+        outfits = bodyslide_auto.discover_outfits(_ANY_GAME)
+        chunks = bodyslide_auto.plan_chunks(
+            {}, outfits, max_data_per_chunk=10_000_000,
+            max_outfits_per_chunk=10)
+        self.assertGreater(len(chunks), 1, "25 outfits with a cap of 10 must split")
+        for chunk in chunks:
+            self.assertLessEqual(len(chunk.outfits), 10, chunk.group)
+        self.assertEqual(sorted(n for c in chunks for n in c.outfits),
+                         sorted(f"O{i}" for i in range(25)))
+
+    def test_choices_round_trip(self) -> None:
+        saved = bodyslide_auto.choices_path
+        try:
+            path = self.root / "choices.json"
+            bodyslide_auto.choices_path = lambda *_a: path  # type: ignore[assignment]
+            self.assertEqual(bodyslide_auto.load_choices(_ANY_GAME, "p"), {})
+            bodyslide_auto.save_choices(_ANY_GAME, "p", {"CBBE": "3BA"})
+            self.assertEqual(bodyslide_auto.load_choices(_ANY_GAME, "p"),
+                             {"CBBE": "3BA"})
+        finally:
+            bodyslide_auto.choices_path = saved  # type: ignore[assignment]
+
+
+    def test_a_subset_group_is_not_an_alternative(self) -> None:
+        """A small group inside a bigger one is a SUBSET, not a variant.
+
+        Regression, found on a real load order: normalising overlap by the
+        smaller group merged the 5-outfit 'CBBE' group with the 32-outfit
+        'CBBE Vanilla Outfits', and skipping the latter would have silently
+        dropped 32 wanted outfits.
+        """
+        self._write_sets([(f"V{i}", 1) for i in range(6)] + [("Base", 1)])
+        self._group("CBBE", ["Base"])
+        self._group("CBBE Vanilla Outfits", [f"V{i}" for i in range(6)])
+        outfits = bodyslide_auto.discover_outfits(_ANY_GAME)
+        alts = bodyslide_auto.detect_alternatives(
+            bodyslide_auto.discover_groups(_ANY_GAME), outfits)
+
+        for alt in alts:
+            self.assertNotIn("CBBE Vanilla Outfits", alt.groups, alt.groups)
+        self.assertEqual(bodyslide_auto.skipped_groups(alts, {}), set())
+
+    def test_a_weak_candidate_is_offered_but_never_skipped(self) -> None:
+        """A shared name prefix is not good enough to drop someone's outfits."""
+        self._write_sets([("S1", 1), ("S2", 1), ("V1", 1), ("V2", 1)])
+        self._group("HIMBO Body for SOS", ["S1", "S2"])
+        self._group("HIMBO Body for Vanilla", ["V1", "V2"])
+        outfits = bodyslide_auto.discover_outfits(_ANY_GAME)
+        alts = bodyslide_auto.detect_alternatives(
+            bodyslide_auto.discover_groups(_ANY_GAME), outfits)
+
+        self.assertEqual(len(alts), 1, alts)
+        self.assertFalse(alts[0].certain, "a name guess must not be certain")
+        self.assertEqual(bodyslide_auto.skipped_groups(alts, {}), set(),
+                         "nothing may be skipped without being certain")
+        # but an explicit choice is honoured
+        self.assertEqual(
+            bodyslide_auto.skipped_groups(alts, {alts[0].key: "HIMBO Body for SOS"}),
+            {"HIMBO Body for Vanilla"})
+
+    def test_identical_groups_are_certain_and_reduced_to_one(self) -> None:
+        self._write_sets([("A", 1), ("B", 1)])
+        self._group("CBBE Vanilla Outfits", ["A", "B"])
+        self._group("CBBE Vanilla Outfits Physics", ["A", "B"])
+        outfits = bodyslide_auto.discover_outfits(_ANY_GAME)
+        alts = bodyslide_auto.detect_alternatives(
+            bodyslide_auto.discover_groups(_ANY_GAME), outfits)
+        self.assertEqual(len(alts), 1, alts)
+        self.assertTrue(alts[0].certain)
+        skip = bodyslide_auto.skipped_groups(alts, {})
+        self.assertEqual(len(skip), 1, "exactly one variant is built")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
