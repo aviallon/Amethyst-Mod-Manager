@@ -4757,7 +4757,19 @@ class MainWindow(QMainWindow):
 
         self._append_log(
             f"[modl] downloaded {result.file_name} from {link.download_host}")
-        self._deliver_download([str(result.file_path)])
+        # SCOPE (decided 2026-10-02): the archive's own root meta.ini is used
+        # as prebuilt metadata ONLY for modl:// installs - no other metadata
+        # source exists for them. Every other install path (NXM, Nexus browser,
+        # manual, collections) keeps its resolved Nexus metadata and never
+        # consults a bundled meta.ini. See Nexus.nexus_meta.bundled_meta_from_archive.
+        from Nexus.nexus_meta import bundled_meta_from_archive
+        bundled = bundled_meta_from_archive(result.file_path)
+        if bundled is not None:
+            self._append_log(
+                f"[modl] using bundled meta.ini from {result.file_name} "
+                f"(name={bundled.nexus_name!r} version={bundled.version!r})")
+        metas = ({str(result.file_path): bundled} if bundled is not None else None)
+        self._deliver_download([str(result.file_path)], metas=metas)
 
     def _receive_ror2mm(self, url: str):
         """UI thread: receive a ror2mm:// link handed over IPC."""

@@ -214,6 +214,100 @@ _META_CACHE: dict[str, tuple[int, NexusModMeta]] = {}
 _META_CACHE_MAX = 8192
 
 
+# ---------------------------------------------------------------------------
+# Bundled meta.ini -- consumed ONLY for modl:// installs (scope decision
+# 2026-10-02: "le meta.ini du mod ne doit etre utilise QUE pour le scheme
+# modl"). A modl archive has NO other metadata source (not on Nexus, no
+# prebuilt meta), so the mod's OWN root meta.ini becomes the prebuilt_meta.
+# Every other source (NXM/Nexus browser, manual install, collections) is
+# untouched: their resolved Nexus metadata stays authoritative and the bundled
+# file is never consulted -- and the install filters in Utils/mods/install.py
+# keep it out of the mod folder either way.
+# ---------------------------------------------------------------------------
+
+def meta_from_ini_text(text: str) -> NexusModMeta:
+    """Parse a ``[General]`` meta.ini blob into a NexusModMeta (key case
+    insensitive, same value coercion as :func:`read_meta`)."""
+    cp = configparser.ConfigParser(allow_no_value=True, strict=False)
+    try:
+        cp.read_string(text)
+    except configparser.Error:
+        return NexusModMeta()
+    meta = NexusModMeta()
+    if not cp.has_section(_SECTION):
+        return meta
+    lower_map = {k.lower(): attr for k, attr in _KEY_MAP.items()}
+    for ini_key, raw in cp.items(_SECTION):
+        attr = lower_map.get(ini_key.lower())
+        if attr is None or raw is None:
+            continue
+        if attr in _INT_FIELDS:
+            try:
+                setattr(meta, attr, int(raw))
+            except ValueError:
+                pass
+        elif attr in _BOOL_FIELDS:
+            setattr(meta, attr, raw.lower() in ("true", "1", "yes"))
+        else:
+            setattr(meta, attr, raw)
+    return meta
+
+
+def bundled_meta_from_archive(archive_path) -> NexusModMeta | None:
+    """Read the mod's own ROOT ``meta.ini`` out of a downloaded archive.
+
+    zip/.fomod/.dazip/.override (zipfile), tar family (tarfile) and 7z (the
+    vendored py7zr) are supported; anything else (rar) returns ``None`` and
+    the install falls back to the previous thin-metadata behaviour.
+    Returns None when the archive has no root meta.ini.
+    """
+    path = Path(archive_path)
+    name = path.name.lower()
+
+    def _from_zip(zf) -> bytes | None:
+        names = {n.replace("\\", "/").lstrip("./").lower(): n for n in zf.namelist()}
+        real = names.get("meta.ini")
+        return zf.read(real) if real else None
+
+    try:
+        if name.endswith((".zip", ".fomod", ".dazip", ".override")):
+            import zipfile
+            with zipfile.ZipFile(path) as zf:
+                data = _from_zip(zf)
+        elif name.endswith((".tar", ".tar.gz", ".tgz", ".tar.bz2", ".tar.xz")):
+            import tarfile
+            with tarfile.open(path) as tf:
+                member = next((m for m in tf.getmembers()
+                               if m.name.replace("\\", "/").lstrip("./").lower()
+                               == "meta.ini"), None)
+                data = tf.extractfile(member).read() if member else None
+        elif name.endswith(".7z"):
+            import py7zr
+            with py7zr.SevenZipFile(path) as zf:
+                names = {n.replace("\\", "/").lstrip("./").lower(): n
+                         for n in zf.getnames()}
+                real = names.get("meta.ini")
+                if real is None:
+                    return None
+                data = zf.read([real])[real].read()
+        else:
+            return None
+    except Exception:                                # noqa: BLE001 - thin meta, not a failure
+        return None
+
+    if not data:
+        return None
+    try:
+        text = data.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        return None
+    meta = meta_from_ini_text(text)
+    # A file that parses but carries nothing useful is not a source.
+    if not (meta.nexus_name or meta.version or meta.description or meta.author):
+        return None
+    return meta
+
+
 def read_meta(meta_ini_path: Path) -> NexusModMeta:
     """
     Parse a ``meta.ini`` file and return a :class:`NexusModMeta`.
