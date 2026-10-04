@@ -460,6 +460,16 @@ class PandoraView(QWidget):
                     log_fn=lambda m: self._log(f"Pandora Wizard: {m}"),
                     on_started=lambda *a: safe_emit(self._run_started_sig, *a),
                     owner=self)
+                # Pandora writes its output straight into staging (possibly
+                # through a Profile Group's symlink farm), which the Filegraph
+                # catalog cannot see - flag the profile so the next deploy
+                # reconciles instead of reusing the old winner generation.
+                mark_dirty = getattr(self._ctx, "mark_staging_dirty", None)
+                if rc == 0 and callable(mark_dirty):
+                    try:
+                        mark_dirty("Pandora wrote behaviour output")
+                    except Exception as exc:
+                        self._log(f"Pandora Wizard: couldn't mark staging dirty: {exc}")
                 if rc != 0:
                     safe_emit(self._run_status_sig,
                         self.tr("Pandora exited with error (code {0}).\nSee the "

@@ -595,6 +595,10 @@ class DynDOLODView(QWidget):
                     extra_args=[data_arg, output_arg, game_flag], label=name,
                     game=game, owner=self)
 
+                # The tool wrote <Tool>_Output into staging; flag the profile
+                # so the next deploy reconciles the catalog.
+                from wizards_qt import notify_wizard_output
+                notify_wizard_output(self._ctx, f"{name} wrote output", self._log)
                 self._log(f"{name} Wizard: {exe.name} closed.")
                 safe_emit(self._run_status_sig, self.tr("{0} finished.").format(name), ok_text())
                 safe_emit(self._run_finished_sig)

@@ -4757,7 +4757,19 @@ class MainWindow(QMainWindow):
 
         self._append_log(
             f"[modl] downloaded {result.file_name} from {link.download_host}")
-        self._deliver_download([str(result.file_path)])
+        # SCOPE (decided 2026-10-02): the archive's own root meta.ini is used
+        # as prebuilt metadata ONLY for modl:// installs - no other metadata
+        # source exists for them. Every other install path (NXM, Nexus browser,
+        # manual, collections) keeps its resolved Nexus metadata and never
+        # consults a bundled meta.ini. See Nexus.nexus_meta.bundled_meta_from_archive.
+        from Nexus.nexus_meta import bundled_meta_from_archive
+        bundled = bundled_meta_from_archive(result.file_path)
+        if bundled is not None:
+            self._append_log(
+                f"[modl] using bundled meta.ini from {result.file_name} "
+                f"(name={bundled.nexus_name!r} version={bundled.version!r})")
+        metas = ({str(result.file_path): bundled} if bundled is not None else None)
+        self._deliver_download([str(result.file_path)], metas=metas)
 
     def _receive_ror2mm(self, url: str):
         """UI thread: receive a ror2mm:// link handed over IPC."""
@@ -12428,6 +12440,7 @@ class MainWindow(QMainWindow):
                 session = self._new_play_session(label)
 
                 def _run(run_path=run_path, session=session):
+                    self._maybe_autobuild_bodyslide(game)
                     # Worker-thread exceptions otherwise vanish to stderr, and
                     # most launch paths fail by logging and returning - the
                     # report catches both, plus a process that dies instantly.
@@ -12492,6 +12505,7 @@ class MainWindow(QMainWindow):
             session = self._new_play_session(game.name)
 
             def _run(session=session):
+                self._maybe_autobuild_bodyslide(game)
                 # Worker-thread exceptions otherwise vanish to stderr, and most
                 # launch paths fail by logging and returning - the report
                 # catches both, plus a process that dies instantly.
@@ -12529,6 +12543,30 @@ class MainWindow(QMainWindow):
             self._on_deploy()
         else:
             _launch()
+
+    def _maybe_autobuild_bodyslide(self, game) -> None:
+        """Run the automatic BodySlide step before a launch, if the game has one.
+
+        Deliberately called from the launch WORKER (never the UI thread) and
+        after any deploy has finished, because the tool reads slider data out of
+        the deployed Data folder. Utils.bethesda.bodyslide_auto swallows its own
+        failures; this wrapper exists so that even a bug in the toggle lookup
+        cannot stop someone playing.
+        """
+        profile = getattr(self._gs, "profile", None)
+        if not profile:
+            return
+        try:
+            from Utils.bethesda import bodyslide_auto
+            if not bodyslide_auto.is_enabled(game):
+                return
+            bodyslide_auto.run_automatic(
+                game, profile,
+                log_fn=lambda line: self._append_log(f"[bodyslide] {line}"),
+                # visible, not just logged: a chunked build can run for minutes
+                status_fn=self._set_play_toast)
+        except Exception as exc:  # noqa: BLE001 - a launch must never be blocked
+            self._append_log(f"[bodyslide] automatic build skipped: {exc!r}")
 
     def _on_play_action(self, which):
         game = self._gs.game
@@ -14311,6 +14349,7 @@ class MainWindow(QMainWindow):
             run_restore=self._wizard_run_restore,
             refresh_modlist=self._on_refresh_modlist,
             refresh_plugins=self._wizard_refresh_plugins,
+            mark_staging_dirty=self._wizard_mark_staging_dirty,
             import_manifest=lambda manifest, stem, bundle_zip:
                 self._open_manifest_import(manifest, stem, bundle_zip=bundle_zip),
             current_profile=lambda: self._gs.profile or "default",
@@ -14451,6 +14490,19 @@ class MainWindow(QMainWindow):
         self._restore_done_hooks.append(on_done)
         self._on_restore()
         return True
+
+    def _wizard_mark_staging_dirty(self, reason: str = "") -> None:
+        """Wizard hook: flag the LIVE active profile's catalog as stale after
+        the wizard wrote tool output (Pandora, BodySlide, DynDOLOD, xEdit QAC,
+        …) directly into staging. The next deploy rebuilds the catalog before
+        planning, so the output is included even when the deploy happens
+        before the wizard tab is closed (the only other catalog rebuild)."""
+        profile_dir = self._gs.profile_dir()
+        if profile_dir is None:
+            return
+        from Utils.filegraph.staleness import mark_staging_dirty
+        mark_staging_dirty(profile_dir, reason,
+                           log_fn=lambda m: self._append_log(str(m)))
 
     def _wizard_refresh_plugins(self):
         """Wizard hook: re-run LOOT to refresh plugin metadata without touching
@@ -17303,6 +17355,13 @@ class MainWindow(QMainWindow):
         force a full index rescan (picks up files added/removed inside mods)."""
         from Utils.mods.modlist import sync_modlist_with_mods_folder
         self._reassert_profile_paths()
+        # Refresh does a full catalog rebuild below; drop any wizard-output
+        # marker so the next deploy doesn't repeat that rebuild for nothing.
+        try:
+            from Utils.filegraph.staleness import consume_staging_dirty
+            consume_staging_dirty(self._gs.profile_dir())
+        except Exception:
+            pass
         # Refresh doubles as the user's "reconcile my group now" button; must
         # run before the folder sync (which drops entries with missing dirs).
         try:

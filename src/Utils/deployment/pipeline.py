@@ -594,19 +594,35 @@ def run_deploy_pipeline(
         if on_pre_filemap is not None:
             on_pre_filemap()
 
+        # Manager-owned writers (wizard tool output) mark the profile dirty
+        # because they write into staging behind Filegraph's back. Consume the
+        # marker and force a full catalog reconcile below; the marker is only
+        # cleared once that reconcile has happened, so an aborted deploy leaves
+        # it for the next attempt.
+        profile_dir = game.get_profile_root() / "profiles" / profile
+        from Utils.filegraph.staleness import consume_staging_dirty, staging_dirty_reason
+        wizard_reason = staging_dirty_reason(profile_dir)
+        force_catalog_refresh = on_pre_filemap is not None or wizard_reason is not None
+
         # Open/reconcile the required native catalog and pin the generation
         # that every deploy handler below will consume. No legacy map is built
         # or refreshed here.
         if progress_fn is not None:
             progress_fn(0, 0, "Reconciling the selected profile…")
         from Utils.filegraph.service import FileGraphService
-        profile_dir = game.get_profile_root() / "profiles" / profile
         filegraph_library = FileGraphService.open_library(
             game, profile_dir, log_fn=log_fn)
-        if on_pre_filemap is not None:
-            # The hook is a manager-owned staging mutation (wizard output), so
-            # update the catalog immediately rather than waiting for Refresh.
+        if force_catalog_refresh:
+            # The hook / wizard output wrote staging after the catalog was
+            # built, so update the catalog immediately rather than waiting for
+            # Refresh (ensure_ready would keep the stale winner generation).
+            if wizard_reason is not None:
+                log_fn(
+                    "Deploy: reconciling staging written by a wizard tool "
+                    f"({wizard_reason or 'wizard output'}) before planning.")
             filegraph_library.refresh(profile_dir)
+            if wizard_reason is not None:
+                consume_staging_dirty(profile_dir)
         else:
             filegraph_library.ensure_ready(profile_dir)
         filegraph_profile = filegraph_library.open_profile(profile_dir)

@@ -418,6 +418,8 @@ class PGPatcherView(WizardViewBase):
                 run_tool_logged(proton_script, exe, env, log_fn=_wlog,
                                 extra_args=extra_args, label="PGPatcher",
                                 game=game, owner=self)
+                from wizards_qt import notify_wizard_output
+                notify_wizard_output(self._ctx, "PGPatcher wrote output", self._log)
                 _wlog("PGPatcher closed.")
                 safe_emit(self._run_status_sig, self.tr("PGPatcher finished."), GREEN)
                 safe_emit(self._run_finished_sig)

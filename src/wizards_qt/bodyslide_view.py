@@ -263,6 +263,10 @@ class BodySlideView(WizardViewBase):
                     run_tool_logged(proton_script, deployed, env,
                                     log_fn=_wlog, label=name, game=game,
                                     owner=self)
+                # BodySlide writes meshes into its output-capture mod; flag the
+                # profile so the next deploy reconciles the catalog.
+                from wizards_qt import notify_wizard_output
+                notify_wizard_output(self._ctx, "BodySlide wrote output", self._log)
                 _wlog(f"{deployed.name} closed.")
                 safe_emit(self._run_status_sig, self.tr("{0} finished.").format(name), GREEN)
                 safe_emit(self._run_finished_sig)

@@ -17,7 +17,9 @@ from typing import TYPE_CHECKING
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
+    QComboBox,
     QHBoxLayout, QLabel, QLineEdit, QProgressBar, QPushButton, QWidget,
+    QVBoxLayout,
 )
 
 from gui_qt.safe_emit import safe_emit
@@ -38,6 +40,10 @@ class BodySlideLinuxView(WizardViewBase):
     _inst_progress_sig = Signal(int)
     _inst_latest_sig = Signal(object)     # (tag, url) | None
     _inst_done_sig = Signal(bool)
+    # Chunked build (see bodyslide_auto): its own status so the worker never
+    # touches a widget, matching how the install page reports progress.
+    _chunk_status_sig = Signal(str, str)
+    _chunk_done_sig = Signal()
 
     def __init__(self, game: "BaseGame", log_fn=None, on_close=None, ctx=None,
                  *, tool: str = "bodyslide", **_extra):
@@ -51,6 +57,10 @@ class BodySlideLinuxView(WizardViewBase):
 
         self._inst_status_sig.connect(self._guard(
             lambda t, c: self._set_status(self._inst_status, t, c)))
+        self._chunk_status_sig.connect(self._guard(
+            lambda t, c: self._set_status(self._deploy_status, t, c)))
+        self._chunk_done_sig.connect(self._guard(
+            lambda: self._chunk_btn.setEnabled(True)))
         self._inst_progress_sig.connect(self._guard(self._on_inst_progress))
         self._inst_latest_sig.connect(self._guard(self._on_latest))
         self._inst_done_sig.connect(self._guard(self._on_install_done))
@@ -248,6 +258,25 @@ class BodySlideLinuxView(WizardViewBase):
         lay.addWidget(row)
 
         self._deploy_status = self._make_status(lay)
+
+        # Alternative variants (body shape / physics). Detection offers sets; the
+        # user picks which one to build, because picking WRONG by guess silently
+        # loses outfits, while building an unwanted variant only costs time. The
+        # choice is stored per profile and invalidates the build fingerprint.
+        note = QLabel(self.tr(
+            "Variants: pick ONE body shape or physics variant per row. Rows are "
+            "detected from group overlap and names; nothing is skipped until "
+            "you choose, and a skipped variant is never built."))
+        note.setWordWrap(True)
+        note.setStyleSheet(self._dim)
+        lay.addWidget(note)
+        self._alt_box = QWidget()
+        self._alt_layout = QVBoxLayout(self._alt_box)
+        self._alt_layout.setContentsMargins(0, 0, 0, 0)
+        self._alt_layout.setSpacing(4)
+        lay.addWidget(self._alt_box)
+        self._alt_combos: list = []
+
         lay.addStretch(1)
         brow = QWidget()
         bh = QHBoxLayout(brow); bh.setContentsMargins(0, 8, 0, 0); bh.setSpacing(8)
@@ -256,6 +285,15 @@ class BodySlideLinuxView(WizardViewBase):
         self._deploy_skip_btn.setCursor(Qt.PointingHandCursor)
         self._deploy_skip_btn.clicked.connect(self._skip_deploy)
         bh.addWidget(self._deploy_skip_btn)
+        self._chunk_btn = QPushButton(self.tr("Chunked build (all outfits)"))
+        self._chunk_btn.setCursor(Qt.PointingHandCursor)
+        self._chunk_btn.setToolTip(self.tr(
+            "Build every outfit one slider group at a time. A single batch "
+            "build of a large load order can exhaust memory and be killed at "
+            "the very end of the build; each chunk here runs in its own "
+            "process, so a build that fails does not take the rest with it."))
+        self._chunk_btn.clicked.connect(self._start_chunked_build)
+        bh.addWidget(self._chunk_btn)
         self._deploy_btn = self._accent_btn(self.tr("Deploy"))
         self._deploy_btn.clicked.connect(self._start_bs_deploy)
         bh.addWidget(self._deploy_btn)
@@ -300,6 +338,8 @@ class BodySlideLinuxView(WizardViewBase):
         self._stack.setCurrentIndex(idx)
         if idx == _PG_INSTALL:
             self._enter_install()
+        elif idx == _PG_DEPLOY:
+            self._populate_alternatives()
         elif idx == _PG_RUN:
             self._set_status(self._run_status,
                              self.tr("Launching {0}…").format(self._name))
@@ -335,6 +375,9 @@ class BodySlideLinuxView(WizardViewBase):
                                   "done, then click Done.").format(name), "")
                 safe_emit(self._run_started_sig)
                 run_logged(program, env, log_fn=self._log_tool, label=name)
+                from wizards_qt import notify_wizard_output
+                notify_wizard_output(self._ctx, "BodySlide wrote output",
+                                     self._log_tool)
                 self._log_tool(f"{name} closed.")
                 safe_emit(self._run_status_sig,
                           self.tr("{0} finished.").format(name), ok_text())
@@ -346,6 +389,150 @@ class BodySlideLinuxView(WizardViewBase):
 
         threading.Thread(target=worker, daemon=True,
                          name="bodyslide-linux-run").start()
+
+    def _start_chunked_build(self):
+        """Build every outfit in budget-sized chunks, driven from the wizard.
+
+        The same work as the automatic pre-launch step, but chosen by the user
+        and visible here: progress per chunk goes to the status line and the
+        log. Needs the deployed Data folder, which is why it sits on this page.
+        """
+        from Utils.bethesda import bodyslide_auto
+
+        game, profile = self._game, self._profile()
+        self._capture_output_mod_name()
+        self._chunk_btn.setEnabled(False)
+
+        def worker():
+            from wizards_qt import notify_wizard_output
+            try:
+                output_dir = (game.get_effective_mod_staging_path()
+                              / self._output_mod_name)
+                output_dir.mkdir(parents=True, exist_ok=True)
+                self._warn_if_no_slider_data(game)
+
+                outfits = bodyslide_auto.discover_outfits(game)
+                groups = bodyslide_auto.discover_groups(game)
+                chunks = bodyslide_auto.plan_chunks(groups, outfits)
+                if not outfits:
+                    safe_emit(self._chunk_status_sig,
+                              self.tr("No outfits found in the deployed "
+                                      "Data folder."), err_text())
+                    return
+                self._log_tool(
+                    f"chunked build: {len(outfits)} outfits, "
+                    f"{len(groups)} group(s), {len(chunks)} chunk(s)")
+                safe_emit(self._chunk_status_sig,
+                          self.tr("Building {0} outfits in {1} chunk(s)…")
+                          .format(len(outfits), len(chunks)), "")
+
+                failures = bodyslide_auto.run_chunked(
+                    game, profile, output_dir=output_dir,
+                    log_fn=self._log_tool)
+                if failures:
+                    safe_emit(self._chunk_status_sig,
+                              self.tr("{0} chunk(s) failed - see the log")
+                              .format(failures), err_text())
+                    return
+                notify_wizard_output(self._ctx, "BodySlide wrote output",
+                                     self._log_tool)
+                safe_emit(self._chunk_status_sig,
+                          self.tr("Built {0} outfits in {1} chunk(s).")
+                          .format(len(outfits), len(chunks)), ok_text())
+            except Exception as exc:
+                safe_emit(self._chunk_status_sig,
+                          self.tr("Chunked build error: {0}").format(exc),
+                          err_text())
+                self._log_tool(f"chunked build error: {exc}")
+            finally:
+                safe_emit(self._chunk_done_sig)
+
+        threading.Thread(target=worker, daemon=True,
+                         name="bodyslide-linux-chunked").start()
+
+    def _populate_alternatives(self):
+        """Fill the variants list from the deployed data (called on this page).
+
+        Reads what is deployed NOW, so it is refreshed by re-entering the page
+        after a deploy rather than by watching the filesystem.
+        """
+        from Utils.bethesda import bodyslide_auto
+
+        while self._alt_layout.count():
+            item = self._alt_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        self._alt_combos = []
+
+        game, profile = self._game, self._profile()
+        if not game or not hasattr(game, "get_effective_mod_staging_path"):
+            return
+        try:
+            self._warn_if_no_slider_data(game)
+            outfits = bodyslide_auto.discover_outfits(game)
+            groups = bodyslide_auto.discover_groups(game)
+            alternatives = bodyslide_auto.detect_alternatives(groups, outfits)
+            choices = bodyslide_auto.load_choices(game, profile)
+        except Exception as exc:
+            self._log_tool(f"could not list variants: {exc}")
+            return
+        if not alternatives:
+            return
+
+        for alt in alternatives:
+            row = QWidget()
+            rh = QHBoxLayout(row)
+            rh.setContentsMargins(0, 0, 0, 0)
+            rh.setSpacing(8)
+            lbl = QLabel(alt.hint or self.tr("variant"))
+            lbl.setStyleSheet(self._dim)
+            lbl.setMinimumWidth(96)
+            rh.addWidget(lbl)
+            combo = QComboBox()
+            combo.setMinimumWidth(260)
+            build_all = self.tr("Build all (no variant chosen)")
+            combo.addItem(build_all)
+            for name in alt.groups:
+                combo.addItem(name)
+            current = choices.get(alt.key)
+            if current in alt.groups:
+                combo.setCurrentIndex(alt.groups.index(current) + 1)
+            combo.currentIndexChanged.connect(
+                lambda _i, a=alt, c=combo: self._on_alternative_chosen(a, c))
+            rh.addWidget(combo)
+            count = QLabel(self.tr("{0} outfits").format(alt.members))
+            count.setStyleSheet(self._dim)
+            rh.addWidget(count)
+            rh.addStretch(1)
+            self._alt_layout.addWidget(row)
+            self._alt_combos.append(combo)
+        self._log_tool(
+            f"variant sets detected: "
+            f"{', '.join('/'.join(a.groups) for a in alternatives)}")
+
+    def _on_alternative_chosen(self, alt, combo):
+        """Persist the pick for this profile; index 0 means 'build all'."""
+        from Utils.bethesda import bodyslide_auto
+
+        game, profile = self._game, self._profile()
+        try:
+            choices = bodyslide_auto.load_choices(game, profile)
+            if combo.currentIndex() <= 0:
+                choices.pop(alt.key, None)
+                self._log_tool(f"variant [{alt.hint}]: building all")
+            else:
+                chosen = combo.currentText()
+                choices[alt.key] = chosen
+                skipped = [g for g in alt.groups if g != chosen]
+                self._log_tool(f"variant [{alt.hint}]: building '{chosen}', "
+                               f"skipping {', '.join(skipped)}")
+            bodyslide_auto.save_choices(game, profile, choices)
+            from wizards_qt import notify_wizard_output
+            notify_wizard_output(self._ctx, "BodySlide variant choice",
+                                 self._log_tool)
+        except Exception as exc:
+            self._log_tool(f"could not save the variant choice: {exc}")
 
     def _warn_if_no_slider_data(self, game):
         """Log when the deployed slider data isn't where the tool looks.

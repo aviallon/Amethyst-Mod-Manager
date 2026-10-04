@@ -445,6 +445,61 @@ class XEditView(QWidget):
         lay.addWidget(self._skip_btn, 0, Qt.AlignHCenter)
         return page
 
+    def _active_profile(self) -> str:
+        """The LIVE active profile name (frozen ctx.profile_name can be stale
+        if the user switched profiles while the wizard was open)."""
+        getter = getattr(self._ctx, "current_profile", None)
+        if callable(getter):
+            try:
+                name = getter()
+                if name:
+                    return str(name)
+            except Exception:
+                pass
+        return getattr(self._ctx, "profile_name", None) or "default"
+
+    def _seed_qac_output(self):
+        """Before the QAC deploy: capture dirty VANILLA masters into an
+        output mod so QuickAutoClean cleans the mod layer, not the vanilla
+        store (Data_Core/) that a Steam verify silently reverts. Non-vanilla
+        plugins are untouched - their owning mod is the correct home."""
+        from Utils.bethesda.xedit import (
+            collect_dirty_plugins, seed_vanilla_master_output,
+        )
+        try:
+            dirty = [name for name, _ in collect_dirty_plugins(self._game)]
+            if not dirty:
+                return
+            seeded = seed_vanilla_master_output(
+                self._game, self._active_profile(), dirty, log_fn=self._log)
+        except Exception as exc:
+            self._log(f"{self._name} Wizard: vanilla-master redirect failed: {exc}")
+            return
+        if seeded:
+            self._log(
+                f"{self._name} Wizard: QAC output will be captured in the "
+                f"output mod for {len(seeded)} vanilla master(s): "
+                + ", ".join(seeded))
+
+    def _capture_qac_vanilla_masters(self, plugins):
+        """After a QAC pass: copy any changed VANILLA master that was not
+        seeded before the deploy (e.g. a plugin the user hand-picked from
+        xEdit's dialog) into the output mod, so the clean cannot land in the
+        vanilla store. Idempotent - already-captured masters are skipped."""
+        if not plugins:
+            return
+        from Utils.bethesda.xedit import seed_vanilla_master_output
+        try:
+            captured = seed_vanilla_master_output(
+                self._game, self._active_profile(), plugins, log_fn=self._log)
+        except Exception as exc:
+            self._log(f"{self._name} Wizard: vanilla-master capture failed: {exc}")
+            return
+        if captured:
+            self._log(
+                f"{self._name} Wizard: captured QAC output for "
+                f"{len(captured)} vanilla master(s): " + ", ".join(captured))
+
     def _start_deploy(self):
         run_deploy = getattr(self._ctx, "run_deploy", None)
         if run_deploy is None:
@@ -452,6 +507,8 @@ class XEditView(QWidget):
                              self.tr("Deploy is unavailable here - Skip to continue."),
                              err_text())
             return
+        if self._qac:
+            self._seed_qac_output()
         self._set_status(self._deploy_status, self.tr("Deploying…"), "")
 
         def _done(ok: bool):
@@ -669,6 +726,9 @@ class XEditView(QWidget):
                 vfs_session = begin_xedit_vfs_session(game, log_fn=_wlog)
                 data_dir = (vfs_session.data_dir if vfs_session is not None
                             else game_path / "Data")
+                from Utils.bethesda.xedit import snapshot_plugin_stats
+                plugin_stats_before = (snapshot_plugin_stats(data_dir)
+                                       if self._qac else {})
 
                 self._log(f"{name} Wizard: launching {exe} via Proton with "
                           f"{' '.join(extra_args)}")
@@ -691,6 +751,18 @@ class XEditView(QWidget):
                 if saved:
                     self._log(
                         f"{name} Wizard: preserved {saved} VFS plugin edit(s).")
+
+                # Interactive QAC: the user picked one plugin in xEdit's
+                # dialog. Re-run it unattended until its CRC is stable so they
+                # do not have to relaunch the tool by hand for the passes that
+                # only converge in a fresh process.
+                if self._qac:
+                    self._iterate_interactive_qac(
+                        game, data_dir, vfs_session, plugin_stats_before,
+                        data_arg, exe, env, proton_script, compat_data,
+                        user_args, name, _wlog)
+                    self._mark_staging_dirty(
+                        f"xEdit QAC interactive run in '{name}'")
 
                 # Move any edited plugin back into its mod folder while the
                 # modindex still knows it - BEFORE the close-refresh rescans
@@ -872,6 +944,7 @@ class XEditView(QWidget):
                 data_dir = (vfs_session.data_dir if vfs_session is not None
                             else game_path / "Data")
                 cleaned = 0
+                from Utils.bethesda.xedit import clean_plugin_to_fixed_point
                 for i, plugin in enumerate(plugins, 1):
                     if self._closing:
                         break
@@ -880,17 +953,36 @@ class XEditView(QWidget):
                                   i, total, plugin), "")
                     self._log(f"{name} Wizard: QAC All - cleaning {plugin} "
                               f"({i}/{total})")
-                    run_tool_logged(proton_script, exe, env, log_fn=_wlog,
-                                    extra_args=base_args + [plugin],
-                                    label=f"{name} [{plugin}]", game=game,
-                                    owner=self)
-                    # Finalise this plugin's <name>.save.<ts> temp before the
-                    # next launch reloads Data/ (QAC queues the rename to run on
-                    # shutdown, but we relaunch into the same prefix).
-                    finalize_xedit_saves(data_dir, log_fn=_wlog)
-                    persist_xedit_vfs_changes(
-                        game, vfs_session, log_fn=_wlog)
+                    plugin_path = Path(data_dir) / plugin
+
+                    def _run_pass(p=plugin_path, index=i):
+                        # One fresh QAC process for this plugin. QAC refuses to
+                        # run with more than one tagged plugin, so the loop is
+                        # per-plugin; the fixed-point wrapper supplies the
+                        # repeat passes when a pass leaves more to clean.
+                        run_tool_logged(proton_script, exe, env, log_fn=_wlog,
+                                        extra_args=base_args + [p.name],
+                                        label=f"{name} [{p.name}]", game=game,
+                                        owner=self)
+                        # Finalise this plugin's <name>.save.<ts> temp before
+                        # the next launch reloads Data/ (QAC queues the rename
+                        # to run on shutdown, but we relaunch into the same
+                        # prefix).
+                        finalize_xedit_saves(data_dir, log_fn=_wlog)
+                        persist_xedit_vfs_changes(
+                            game, vfs_session, log_fn=_wlog)
+
+                    clean_plugin_to_fixed_point(
+                        plugin_path, _run_pass, max_passes=4,
+                        label=plugin, log_fn=_wlog)
                     cleaned += 1
+
+                # The cleaned plugins now live in staging; make sure the next
+                # deploy reconciles the catalog rather than reusing the old
+                # winner generation (see Utils.filegraph.staleness).
+                self._capture_qac_vanilla_masters(plugins)
+                self._mark_staging_dirty(
+                    f"xEdit QAC All cleaned {cleaned} plugin(s)")
 
                 shutdown_prefix_wineserver(proton_script, compat_data,
                                            log_fn=_wlog)
@@ -943,6 +1035,76 @@ class XEditView(QWidget):
         self._qac_launch_btn.setEnabled(True)
         self._qac_all_btn.setEnabled(True)
         self._qac_choice_row.setVisible(True)
+
+    # ---- shared -------------------------------------------------------------
+    def _mark_staging_dirty(self, reason: str):
+        """Tell the app the active profile's catalog is stale (wizard output
+        written straight into staging) so the next deploy reconciles it."""
+        hook = getattr(self._ctx, "mark_staging_dirty", None)
+        if callable(hook):
+            try:
+                hook(reason)
+            except Exception as exc:
+                self._log(f"{self._name} Wizard: couldn't mark staging dirty: {exc}")
+
+    def _iterate_interactive_qac(
+        self, game, data_dir, vfs_session, stats_before, data_arg,
+        exe, env, proton_script, compat_data, user_args, name, _wlog,
+    ):
+        """Re-run the plugins an interactive QAC session touched until their
+        CRC stops changing. Detection uses the cheap (size, mtime) snapshot,
+        and only LOOT-dirty plugins are iterated - a manually cleaned plugin
+        with no LOOT entry has no fixed point to aim for."""
+        from Utils.bethesda.xedit import (
+            clean_plugin_to_fixed_point, collect_dirty_plugins,
+            plugins_changed_since,
+        )
+        try:
+            changed = plugins_changed_since(data_dir, stats_before)
+        except Exception as exc:
+            _wlog(f"could not detect changed plugins: {exc}")
+            return
+        if not changed:
+            return
+        # Capture any changed vanilla master that was not seeded before the
+        # deploy (a hand-picked plugin) so its clean lands in the mod layer.
+        self._capture_qac_vanilla_masters(changed)
+        dirty = {plugin.lower() for plugin, _ in collect_dirty_plugins(game)}
+        targets = [plugin for plugin in changed if plugin.lower() in dirty]
+        if not targets:
+            _wlog("no LOOT-dirty plugin changed - skipping auto-iteration.")
+            return
+        self._log(f"{name} Wizard: auto-converging {len(targets)} dirty "
+                  f"plugin(s): " + ", ".join(targets))
+        from Utils.wine.paths import to_wine_path
+        from Utils.executables.launch import run_tool_logged
+        pfx = compat_data / "pfx"
+        base = [data_arg, "-autoload", "-autoexit"]
+        if self._use_64bit:
+            base.append(f'-s:{to_wine_path(exe.parent.parent / "Edit Scripts", pfx)}\\')
+        if self._discord or self._use_64bit:
+            base.insert(0, "-quickautoclean")
+        if self._discord and self._discord_mode:
+            base.insert(0, f"-{self._discord_mode}")
+        if user_args:
+            base.extend(user_args)
+        for plugin in targets:
+            plugin_path = Path(data_dir) / plugin
+
+            def _run_pass(p=plugin_path):
+                run_tool_logged(proton_script, exe, env, log_fn=_wlog,
+                                extra_args=base + [p.name],
+                                label=f"{name} [{p.name}]", game=game,
+                                owner=self)
+                from Utils.bethesda.xedit import (
+                    finalize_xedit_saves, persist_xedit_vfs_changes,
+                )
+                finalize_xedit_saves(data_dir, log_fn=_wlog)
+                persist_xedit_vfs_changes(game, vfs_session, log_fn=_wlog)
+
+            clean_plugin_to_fixed_point(
+                plugin_path, _run_pass, max_passes=3,
+                label=plugin, log_fn=_wlog)
 
     # ---- shared -------------------------------------------------------------
     def _goto_step(self, idx: int):
