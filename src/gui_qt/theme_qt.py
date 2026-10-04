@@ -318,13 +318,74 @@ def system_theme_id() -> str:
 
 
 _system_listener_connected = False
+_applied_system_theme_id: str | None = None
+
+
+def _maybe_retheme_for_system() -> None:
+    """Re-theme on a PLATFORM palette/scheme change while mode is 'system'.
+
+    Called from BOTH delivery channels: QStyleHints.colorSchemeChanged AND the
+    application-level ApplicationPaletteChange/ThemeChange events (what Plasma
+    actually sends on a desktop theme switch - the native palette propagates
+    even when colorSchemeChanged never fires, which left inline QSS colours
+    stale against fresh palette surfaces: unreadable mixed rendering).
+    Loop-safe: apply_theme records the applied id BEFORE touching the
+    palette, so the PaletteChange it provokes resolves to the same id and is
+    ignored.
+    """
+    global _applied_system_theme_id
+    if get_appearance_mode() != "system":
+        return
+    resolved = system_theme_id()
+    if resolved == _applied_system_theme_id:
+        return
+    from PySide6.QtGui import QGuiApplication
+    app = QGuiApplication.instance()
+    if app is None:
+        return
+    invalidate_palette_cache()
+    apply_theme(app)
+
+
+class _SystemSchemeWatcher:
+    """Application event filter bridging Qt's palette-change channel."""
+
+    def eventFilter(self, obj, ev):  # noqa: ANN001
+        try:
+            from PySide6.QtCore import QEvent
+            if ev.type() in (QEvent.ApplicationPaletteChange, QEvent.ThemeChange):
+                _maybe_retheme_for_system()
+        except Exception:
+            pass
+        return False
+
+
+_system_watcher_holder = [None]
+
+
+def _make_watcher():
+    """A real QObject subclass (NOT a QObject+mixin - PySide refuses or
+    silently breaks those): eventFilter must be a virtual override."""
+    from PySide6.QtCore import QObject, QEvent
+
+    class _Watcher(QObject):
+        def eventFilter(self, obj, ev):  # noqa: ANN001
+            try:
+                if ev.type() in (QEvent.ApplicationPaletteChange, QEvent.ThemeChange):
+                    _maybe_retheme_for_system()
+            except Exception:
+                pass
+            return False
+
+    return _Watcher()
 
 
 def _connect_system_scheme_listener() -> None:
     """Follow live platform scheme changes while appearance_mode is 'system'.
 
-    Idempotent; called from apply_theme(). The handler re-resolves and
-    re-applies the theme only when the user actually opted into 'system'.
+    Idempotent; called from apply_theme(). Covers both delivery channels:
+    colorSchemeChanged (explicit scheme API) and ApplicationPaletteChange
+    (the palette propagation Plasma performs on a desktop theme switch).
     """
     global _system_listener_connected
     if _system_listener_connected:
@@ -337,20 +398,17 @@ def _connect_system_scheme_listener() -> None:
     except Exception:
         return
 
-    def _on_scheme_changed(_scheme=None) -> None:
-        if get_appearance_mode() != "system":
-            return
-        app = QGuiApplication.instance()
-        if app is None:
-            return
-        invalidate_palette_cache()
-        apply_theme(app)
-
     try:
-        hints.colorSchemeChanged.connect(_on_scheme_changed)
-        _system_listener_connected = True
+        hints.colorSchemeChanged.connect(lambda _s=None: _maybe_retheme_for_system())
     except Exception:
         pass
+    try:
+        if _system_watcher_holder[0] is None:
+            _system_watcher_holder[0] = _make_watcher()
+        QGuiApplication.instance().installEventFilter(_system_watcher_holder[0])
+    except Exception:
+        pass
+    _system_listener_connected = True
 
 
 def _c(pal: dict, key: str) -> str:
@@ -1413,9 +1471,16 @@ def apply_theme(app, palette: dict | None = None) -> dict:
     then bound non-QSS consumers (delegates, models, icons and rich text) are
     notified. The resulting palette is returned for focused tests/callers.
     """
-    global _active_palette_cache, _applied_base_style_name
+    global _active_palette_cache, _applied_base_style_name, _applied_system_theme_id
     # Follow the platform scheme while appearance_mode is 'system' (option 2).
     _connect_system_scheme_listener()
+    # Record the applied system id BEFORE touching Qt: the palette work below
+    # emits ApplicationPaletteChange, and the watcher must see the id already
+    # updated or it would loop.
+    if get_appearance_mode() == "system":
+        _applied_system_theme_id = system_theme_id()
+    else:
+        _applied_system_theme_id = None
     old = _active_palette_cache
     if palette is None:
         _active_palette_cache = None

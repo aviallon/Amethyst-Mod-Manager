@@ -55,6 +55,10 @@ def _parse_version(s: str) -> tuple:
     '1.3.1-beta.1'  -> ((1, 3, 1), (0, 'beta', 1))      # pre-release sorts before stable
     """
     s = s.strip().lstrip("v")
+    # PEP 440 local version: '2.5.0+viallon4' is the upstream base plus our
+    # fork revision - the revision must NOT affect the comparison against
+    # upstream releases (option A, 2026-10-04).
+    s = s.split("+", 1)[0]
     if "-" in s:
         core, pre = s.split("-", 1)
     else:

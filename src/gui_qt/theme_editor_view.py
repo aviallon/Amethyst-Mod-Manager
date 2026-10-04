@@ -316,6 +316,16 @@ class ThemeEditorView(QWidget):
         # Working state -----------------------------------------------------
         self._palettes = load_palettes()
         self._names = load_display_names()
+        # 'system' pseudo-theme (option 2): seed an edit from the platform look,
+        # exactly like the settings gallery offers it.
+        try:
+            from gui_qt.theme_qt import system_theme_id
+            _sys = self._palettes.get(system_theme_id())
+            if _sys:
+                self._palettes = {"system": dict(_sys), **self._palettes}
+                self._names = {**self._names, "system": self.tr("System")}
+        except Exception:
+            pass
         self._advanced = False
         # id of the theme currently being edited (None until Save As on a
         # built-in; a custom id once loaded/saved) - controls Save vs Save As.
