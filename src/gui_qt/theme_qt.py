@@ -150,8 +150,9 @@ _QSS_PALETTE_EXPRESSIONS = {
     "BG_LIST": "palette(base)",
     "BG_ROW_ALT": "palette(alternate-base)",
     "BG_HEADER": "palette(button)",
-    "BG_ROW": "palette(dark)",
-    "BG_ROW_HOVER": "palette(shadow)",
+    # BG_ROW / BG_ROW_HOVER removed from this map on purpose (option 2,
+    # 2026-10-02): they aliased QPalette.Dark/Shadow and required hijacking
+    # Fusion's shading roles. See the note below the map.
     "BG_SELECT": "palette(highlight)",
     "TEXT_ON_ACCENT": "palette(highlighted-text)",
     # Qt's stylesheet role is `tooltip-base` (unlike the QPalette enum name
@@ -162,10 +163,17 @@ _QSS_PALETTE_EXPRESSIONS = {
     "LINK_BLUE": "palette(link)",
     "ACCENT": "palette(accent)",
     "ACCENT_HOV": "palette(link-visited)",
-    "BORDER_FAINT": "palette(light)",
-    "BORDER_DIM": "palette(midlight)",
-    "BORDER": "palette(mid)",
+    # BORDER_FAINT / BORDER_DIM / BORDER removed for the same reason:
+    # Light/Midlight/Mid must keep their Qt shading meaning.
 }
+
+# NOTE (option 2, 2026-10-02): five keys - BG_ROW, BG_ROW_HOVER, BORDER_FAINT,
+# BORDER_DIM, BORDER - were deliberately removed from _QSS_PALETTE_EXPRESSIONS.
+# They used to route through QPalette.Dark/Shadow/Light/Midlight/Mid, which
+# forced build_qpalette() to hijack those roles and broke every consumer using
+# their real meaning (Fusion bevels/frames, scrollbar shading, dialogs). With
+# no entry here, the renderer falls back to the tagged inline value (_c),
+# which _render_theme_tokens keeps current exactly like every other theme key.
 
 # These values are baked into paths to pre-tinted PNGs and therefore are not
 # represented by the semantic comments in the QSS text itself.  Rebuild the
@@ -252,14 +260,17 @@ def invalidate_palette_cache() -> None:
 
 def active_palette() -> dict:
     """Return the {KEY: hex} palette for the Qt app. Defaults to the amethyst palette;
-    an explicit saved appearance_mode theme wins when present. (Values may be str
-    or (light,dark) tuples; _c() normalises them.) Memoised - see
-    invalidate_palette_cache()."""
+    an explicit saved appearance_mode theme wins when present. The special mode
+    ``system`` resolves through :func:`system_theme_id` (follow the platform's
+    light/dark scheme). (Values may be str or (light,dark) tuples; _c()
+    normalises them.) Memoised - see invalidate_palette_cache()."""
     global _active_palette_cache
     if _active_palette_cache is not None:
         return _active_palette_cache
     palettes = load_palettes()
     mode = get_appearance_mode()
+    if mode == "system":
+        mode = system_theme_id()
     if mode and mode in palettes:
         pal = palettes[mode]
     else:
@@ -270,8 +281,89 @@ def active_palette() -> dict:
     return pal
 
 
+# "system" appearance mode: which theme id each platform scheme maps to.
+_SYSTEM_DARK_THEME = "amethyst"
+_SYSTEM_LIGHT_THEME = "light"
+
+
+def system_theme_id() -> str:
+    """Map the platform's colour scheme to one of our theme ids.
+
+    Qt 6.5+ exposes the scheme via QStyleHints.colorScheme(); when it reports
+    Unknown (or no GUI exists yet) we infer it from the palette the platform
+    theme actually set (Window lightness). KDE's platform theme does not
+    implement requestColorScheme() (programmatic forcing is a no-op there), so
+    FOLLOWING the platform is the only reliable direction - hence this
+    resolver rather than Qt::ColorScheme overrides.
+    """
+    try:
+        from PySide6.QtGui import QGuiApplication
+        from PySide6.QtCore import Qt
+        # styleHints() is a qFatal (abort, not a catchable Python exception)
+        # when no QGuiApplication exists yet - guard first.
+        if QGuiApplication.instance() is not None:
+            scheme = QGuiApplication.styleHints().colorScheme()
+            if scheme == Qt.ColorScheme.Dark:
+                return _SYSTEM_DARK_THEME
+            if scheme == Qt.ColorScheme.Light:
+                return _SYSTEM_LIGHT_THEME
+    except Exception:
+        pass
+    try:
+        from PySide6.QtGui import QGuiApplication, QPalette
+        window = QGuiApplication.palette().color(QPalette.Window)
+        return _SYSTEM_DARK_THEME if window.lightness() < 128 else _SYSTEM_LIGHT_THEME
+    except Exception:
+        return _SYSTEM_DARK_THEME
+
+
+_system_listener_connected = False
+
+
+def _connect_system_scheme_listener() -> None:
+    """Follow live platform scheme changes while appearance_mode is 'system'.
+
+    Idempotent; called from apply_theme(). The handler re-resolves and
+    re-applies the theme only when the user actually opted into 'system'.
+    """
+    global _system_listener_connected
+    if _system_listener_connected:
+        return
+    try:
+        from PySide6.QtGui import QGuiApplication
+        if QGuiApplication.instance() is None:
+            return
+        hints = QGuiApplication.styleHints()
+    except Exception:
+        return
+
+    def _on_scheme_changed(_scheme=None) -> None:
+        if get_appearance_mode() != "system":
+            return
+        app = QGuiApplication.instance()
+        if app is None:
+            return
+        invalidate_palette_cache()
+        apply_theme(app)
+
+    try:
+        hints.colorSchemeChanged.connect(_on_scheme_changed)
+        _system_listener_connected = True
+    except Exception:
+        pass
+
+
 def _c(pal: dict, key: str) -> str:
-    val = pal.get(key, _FALLBACK)
+    val = pal.get(key)
+    if val is None:
+        # Missing key: derive from the THEME (the old hardcoded dark #1a1a1a
+        # left dark patches in light themes). Surfaces fall back to the theme's
+        # own deepest background; text-ish keys to a readable contrast on it.
+        bg = str(pal.get("BG_DEEP", _FALLBACK))
+        if key.upper().startswith(("BG_", "BORDER", "ROW")):
+            val = bg
+        else:
+            val = contrast_text(bg, dark=_FALLBACK, light="#f2f2f2")
     # Palette values may be (light, dark) tuples in some themes; take a string.
     if isinstance(val, (tuple, list)):
         val = val[-1]
@@ -1016,16 +1108,17 @@ def build_qpalette(p: dict) -> "QPalette":
     pal.setColor(QPalette.Accent, c("ACCENT"))
     # Used by global QSS as the auto-contrasted label on accent fills.
     pal.setColor(QPalette.BrightText, qc_contrast(p, "ACCENT"))
-    # Fusion draws bevels/frames from these shade roles. The three border roles
-    # keep that chrome coherent; Dark/Shadow double as two frequently used row
-    # surfaces in QSS (both remain suitably dark shade colours in stock themes).
-    pal.setColor(QPalette.Light, c("BORDER_FAINT"))
-    pal.setColor(QPalette.Midlight, c("BORDER_DIM"))
-    pal.setColor(QPalette.Mid, c("BORDER"))
-    # Dark/Shadow are close semantic fits for the ordinary/hover row surfaces
-    # and let the very common base-background edit avoid a global QSS reset.
-    pal.setColor(QPalette.Dark, c("BG_ROW"))
-    pal.setColor(QPalette.Shadow, c("BG_ROW_HOVER"))
+    # Fusion draws bevels/frames from the Light/Midlight/Mid/Dark/Shadow shade
+    # roles (their documented meaning, QPalette: Light/Dark/Mid/Midlight/Shadow
+    # form the 3D shading set). They are DERIVED here from the button colour,
+    # never repurposed: hijacking them as row/border surfaces (the pre-option-2
+    # behaviour) broke Fusion chrome, scrollbars and native dialogs.
+    btn = QColor(_c(p, "BG_HEADER"))
+    pal.setColor(QPalette.Light, btn.lighter(118))
+    pal.setColor(QPalette.Midlight, btn.lighter(107))
+    pal.setColor(QPalette.Mid, btn.darker(112))
+    pal.setColor(QPalette.Dark, btn.darker(138))
+    pal.setColor(QPalette.Shadow, btn.darker(190))
     # Keep selection vivid even when the window/widget isn't focused (otherwise
     # Fusion greys the Inactive-group highlight, which looks broken in lists).
     pal.setColor(QPalette.Inactive, QPalette.Highlight, c("BG_SELECT"))
@@ -1321,6 +1414,8 @@ def apply_theme(app, palette: dict | None = None) -> dict:
     notified. The resulting palette is returned for focused tests/callers.
     """
     global _active_palette_cache, _applied_base_style_name
+    # Follow the platform scheme while appearance_mode is 'system' (option 2).
+    _connect_system_scheme_listener()
     old = _active_palette_cache
     if palette is None:
         _active_palette_cache = None

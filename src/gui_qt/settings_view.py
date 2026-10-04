@@ -915,6 +915,16 @@ class SettingsView(ConnectionsSettingsMixin, OverlayBase):
         except Exception:
             names = {"dark": "Dark", "light": "Light"}
             palettes = {}
+        # 'system' pseudo-theme (option 2): follows the platform light/dark
+        # scheme. Its preview tile shows the currently resolved look.
+        try:
+            from gui_qt.theme_qt import system_theme_id
+            _sys_palette = palettes.get(system_theme_id())
+            if _sys_palette:
+                palettes = {"system": dict(_sys_palette), **palettes}
+                names = {**names, "system": self.tr("System")}
+        except Exception:
+            pass
         current = select_id
         if current is None:
             try:
