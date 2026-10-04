@@ -163,6 +163,20 @@ jobs:
           name: filegraph-native
           path: src
 
+      - name: Stamp the fork version into src/version.py (option A)
+        # The app's displayed/checked version carries the fork revision:
+        # '<base>+viallon<N>' (PEP 440 local - _parse_version ignores the
+        # suffix, so upstream update checks stay on the base).
+        run: |
+          set -euo pipefail
+          ver='${{ needs.meta.outputs.subject }}'
+          if [ -n "$ver" ]; then
+            sed -i "s/^__version__ = .*/__version__ = \"$ver\"/" src/version.py
+          else
+            echo "no subject (dry run) - keeping the committed version"
+          fi
+          grep -n "__version__" src/version.py
+
       - name: Assert the extension is where meson expects it
         run: |
           set -euo pipefail

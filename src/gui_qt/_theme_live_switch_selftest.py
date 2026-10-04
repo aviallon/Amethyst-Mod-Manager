@@ -98,6 +98,31 @@ def main() -> int:
                 == str(pal_a["BG_DEEP"]).lower(),
                 "flip back restores the state-A palette")
 
+    # ---- THE REAL PLASMA CHANNEL: ApplicationPaletteChange ---------------
+    # On a desktop theme switch Plasma propagates a fresh palette natively;
+    # colorSchemeChanged may never fire. The watcher must catch that event
+    # too, or inline QSS colours stay stale against updated palette surfaces
+    # (observed in the field: backgrounds follow, fonts unreadable).
+    other["id"] = theme_qt._SYSTEM_LIGHT_THEME
+    from PySide6.QtCore import QEvent, QCoreApplication
+    ok &= claim(theme_qt._system_watcher_holder[0] is not None,
+                "palette-change event filter is INSTALLED (watcher object exists)")
+    ev = QEvent(QEvent.ApplicationPaletteChange)
+    QCoreApplication.sendEvent(app, ev)
+    css_d = app.styleSheet()
+    ok &= claim(css_d != css_c,
+                "ApplicationPaletteChange alone re-themes (the Plasma delivery path)")
+    ok &= claim(theme_qt._c(theme_qt.active_palette(), "BG_ROW").lower() in hexes(css_d),
+                "inline QSS colours updated through the palette-change channel")
+    ok &= claim(app.palette().color(QPalette.Window).name().lower()
+                == theme_qt._c(theme_qt.active_palette(), "BG_DEEP").lower(),
+                "palette surfaces + inline colours coherent after the palette-change path")
+
+    # Re-entrancy guard: the apply above emitted PaletteChange itself; the
+    # watcher must have ignored it (same resolved id -> no loop).
+    css_e = app.styleSheet()
+    ok &= claim(css_e == css_d, "no re-entrant loop (stable after the event)")
+
     # ---- Scope: outside 'system' mode the signal must do NOTHING ----------
     modes["mode"] = theme_qt._SYSTEM_DARK_THEME
     theme_qt.invalidate_palette_cache()
