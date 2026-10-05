@@ -175,6 +175,110 @@ _QSS_PALETTE_EXPRESSIONS = {
 # no entry here, the renderer falls back to the tagged inline value (_c),
 # which _render_theme_tokens keeps current exactly like every other theme key.
 
+# ---------------------------------------------------------------------------
+# SYSTEM MODE (state of the art, 2026-10-05): follow the platform palette.
+#
+# On KDE the platform palette IS KColorScheme's output (Breeze parity,
+# third-party schemes, high-contrast), so deriving everything from it is the
+# correct KDE support - no extra dependency, and app.setPalette() is NEVER
+# called in this mode (native dialogs and widgets stay exactly the desktop).
+# Every token that has a real Qt role routes to it; the few semantic extras
+# (hover row, dim text) are derived from the palette at render time; status
+# colours (ok/warn/error) stay semantic constants by design - they must not
+# repaint with the theme.
+# ---------------------------------------------------------------------------
+
+_SYSTEM_QSS_EXPRESSIONS = {
+    "BG_DEEP": "palette(window)",
+    "BG_MAIN": "palette(window)",
+    "TEXT_MAIN": "palette(window-text)",
+    "BG_LIST": "palette(base)",
+    "BG_ROW": "palette(base)",
+    "BG_ROW_ALT": "palette(alternate-base)",
+    "BG_HEADER": "palette(button)",
+    "BG_SELECT": "palette(highlight)",
+    "TEXT_ON_ACCENT": "palette(highlighted-text)",
+    "BG_PANEL": "palette(tooltip-base)",
+    "TEXT_FAINT": "palette(placeholder-text)",
+    "LINK_BLUE": "palette(link)",
+    "ACCENT": "palette(accent)",
+    "BORDER": "palette(mid)",
+    "BORDER_FAINT": "palette(light)",
+    "BORDER_DIM": "palette(midlight)",
+}
+
+_PLATFORM_DERIVED = "_PLATFORM_DERIVED"
+
+
+def _blend(a: str, b: str, t: float) -> str:
+    """Linear blend of two #rrggbb colours (t toward b)."""
+    def _rgb(h: str) -> tuple[int, int, int]:
+        h = h.lstrip("#")
+        return int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+    try:
+        ra, rb = _rgb(a), _rgb(b)
+    except Exception:
+        return a
+    return "#%02x%02x%02x" % tuple(
+        round(ra[i] + (rb[i] - ra[i]) * t) for i in range(3))
+
+
+def derive_platform_tokens() -> dict:
+    """Semantic token dict derived from the LIVE platform palette.
+
+    Only real QPalette roles are read; the derived keys are computed from
+    them (hover rows, dim text, accent variants). Marked _PLATFORM_DERIVED so
+    build_qss knows to use _SYSTEM_QSS_EXPRESSIONS and apply_theme knows not
+    to override the application palette.
+    """
+    from PySide6.QtGui import QGuiApplication, QPalette
+    pal = QGuiApplication.palette()
+    col = lambda role: pal.color(role).name()
+    win, base = col(QPalette.Window), col(QPalette.Base)
+    accent = col(QPalette.Accent) if hasattr(QPalette, "Accent") else col(QPalette.Highlight)
+    p = {
+        _PLATFORM_DERIVED: "1",
+        "BG_DEEP": win,
+        "BG_MAIN": win,
+        "TEXT_MAIN": col(QPalette.WindowText),
+        "BG_LIST": base,
+        "BG_ROW": base,
+        "BG_ROW_ALT": col(QPalette.AlternateBase),
+        "BG_ROW_HOVER": _blend(base, col(QPalette.Highlight), 0.16),
+        "BG_HEADER": col(QPalette.Button),
+        "BG_SELECT": col(QPalette.Highlight),
+        "TEXT_ON_ACCENT": col(QPalette.HighlightedText),
+        "TEXT_DIM": _blend(col(QPalette.WindowText), win, 0.45),
+        "TEXT_FAINT": col(QPalette.PlaceholderText),
+        "BG_PANEL": col(QPalette.ToolTipBase),
+        "LINK_BLUE": col(QPalette.Link),
+        "ACCENT": accent,
+        "ACCENT_HOV": _blend(accent, col(QPalette.WindowText), 0.25),
+        "BORDER": col(QPalette.Mid),
+        "BORDER_FAINT": col(QPalette.Light),
+        "BORDER_DIM": col(QPalette.Midlight),
+    }
+    # Semantic status colours: deliberately theme-independent (a success
+    # green must not repaint with the desktop) but must stay legible on the
+    # current surfaces - derived contrast picks the label colour.
+    for key, value in _SEMANTIC_CONSTANTS.items():
+        p[key] = value
+    return p
+
+
+# Status/action colours shared by custom themes AND system mode.
+_SEMANTIC_CONSTANTS = {
+    "TEXT_OK_BRIGHT": "#7ee787",
+    "TEXT_WARN_BRIGHT": "#e3b341",
+    "STATUS_ERR_BRIGHT": "#ff7b72",
+    "BTN_SUCCESS": "#2ea043",
+    "BTN_SUCCESS_HOV": "#3fb950",
+    "RED_BTN": "#d73a49",
+    "RED_HOV": "#f85149",
+    "CHECK_FILL": "#2ea043",
+    "DROPDOWN_ARROW": "#8b949e",
+}
+
 # These values are baked into paths to pre-tinted PNGs and therefore are not
 # represented by the semantic comments in the QSS text itself.  Rebuild the
 # application QSS when one changes; all other roles can be updated in-place.
@@ -269,6 +373,15 @@ def active_palette() -> dict:
         return _active_palette_cache
     palettes = load_palettes()
     mode = get_appearance_mode()
+    if mode == "system":
+        # State of the art: the platform palette is the source of truth (on
+        # KDE it already is KColorScheme's output). No app-level palette or
+        # style override happens in this mode.
+        try:
+            _active_palette_cache = derive_platform_tokens()
+            return _active_palette_cache
+        except Exception:
+            mode = _QT_DEFAULT_THEME
     if mode == "system":
         mode = system_theme_id()
     if mode and mode in palettes:
@@ -603,12 +716,13 @@ def _refresh_application_stylesheet(app, old: dict | None, new: dict,
 def build_qss(pal: dict | None = None) -> str:
     """Build the application QSS from a palette (default: active palette)."""
     p = pal or active_palette()
-    c = lambda k: _QSS_PALETTE_EXPRESSIONS.get(k, _c(p, k))
+    exprs = _SYSTEM_QSS_EXPRESSIONS if p.get(_PLATFORM_DERIVED) else _QSS_PALETTE_EXPRESSIONS
+    c = lambda k: exprs.get(k, _c(p, k))
     # Auto-contrast text for a coloured fill: label visibility beats palette
     # choice, so button text is never editable - it's derived from the fill.
     ct = lambda k: ("palette(bright-text)" if k == "ACCENT"
                     else contrast_text(_c(p, k)))
-    cf = lambda k, fallback: _c(p, k) if k in p else _c(p, fallback)
+    cf = lambda k, fallback: c(k) if k in p else c(fallback)
     return f"""
     QWidget {{
         color: {c('TEXT_MAIN')};
@@ -1490,8 +1604,9 @@ def apply_theme(app, palette: dict | None = None) -> dict:
         _active_palette_cache = p
 
     changed_roles = _changed_palette_roles(old, p)
+    platform_mode = bool(p.get(_PLATFORM_DERIVED))
     style_name = _resolve_base_style_name(p)
-    style_changed = _applied_base_style_name != style_name
+    style_changed = (not platform_mode) and _applied_base_style_name != style_name
 
     # The editor can confirm the currently selected colour. Keep the existing
     # runtime snapshot in that case so identity-based palette references remain
@@ -1505,7 +1620,11 @@ def apply_theme(app, palette: dict | None = None) -> dict:
         app.setStyle(_make_proxy_style(base))
         _applied_base_style_name = style_name
 
-    if style_changed or old is None or not _QPALETTE_ROLES.isdisjoint(changed_roles):
+    if platform_mode:
+        # NEVER override the application palette or style in system mode:
+        # native dialogs, widgets and the desktop's own scheme stay exact.
+        pass
+    elif style_changed or old is None or not _QPALETTE_ROLES.isdisjoint(changed_roles):
         _apply_qpalette(app, p)
     application_restyled = _refresh_application_stylesheet(
         app, old, p, changed_roles)
