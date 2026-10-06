@@ -231,6 +231,18 @@ def _blend(a: str, b: str, t: float) -> str:
         round(ra[i] + (rb[i] - ra[i]) * t) for i in range(3))
 
 
+def _state_tint(alt_hex: str, hue_hex: str, t: float) -> str:
+    """KDE-style SECOND contrasting background (KColorScheme rule, 2026-10-06):
+    the semantic hue is re-projected to the AlternateBase lightness before the
+    blend, so the band keeps its meaning AND lands exactly in the theme's
+    contrast family - no light patches in a dark theme, none dark in a light
+    one. Its paired foreground is contrast_text() of the result."""
+    from PySide6.QtGui import QColor
+    a, h = QColor(alt_hex), QColor(hue_hex)
+    h.setHsv(h.hue(), h.saturation(), a.lightness())
+    return _blend(alt_hex, h.name(), t)
+
+
 def derive_platform_tokens() -> dict:
     """Semantic token dict derived from the LIVE platform palette.
 
@@ -243,6 +255,7 @@ def derive_platform_tokens() -> dict:
     pal = QGuiApplication.palette()
     col = lambda role: pal.color(role).name()
     win, base = col(QPalette.Window), col(QPalette.Base)
+    alt = col(QPalette.AlternateBase)
     accent = col(QPalette.Accent) if hasattr(QPalette, "Accent") else col(QPalette.Highlight)
     p = {
         _PLATFORM_DERIVED: "1",
@@ -269,6 +282,41 @@ def derive_platform_tokens() -> dict:
         "SCROLL_TROUGH": win,
         "SCROLL_BG": _blend(win, col(QPalette.WindowText), 0.22),
         "SCROLL_ACTIVE": accent,
+        # ---- STATE SURFACES: the KDE way for a second contrasting bg -----
+        # KColorScheme's designated second background is AlternateBackground
+        # (QPalette.AlternateBase): built to stay readable with the same
+        # foreground as the base. Every state tint is AlternateBase blended
+        # toward its semantic hue - it keeps its meaning AND the theme's
+        # contrast family (no light patches in a dark theme, reported
+        # 2026-10-06). Paired foregrounds are computed from the actual band
+        # so the text is always readable.
+        "BG_HOVER": _blend(alt, col(QPalette.WindowText), 0.08),
+        "BG_GREEN_ROW": _state_tint(alt, "#7ee787", 0.18),
+        "CONFLICT_HL_WIN": _state_tint(alt, "#7ee787", 0.22),
+        "CONFLICT_HL_LOSE": _state_tint(alt, "#ff7b72", 0.22),
+        "CONFLICT_HL_ANCHOR": _state_tint(alt, "#e3b341", 0.22),
+        "REQ_HL_REQUIRES": _state_tint(alt, "#a855f7", 0.22),
+        "REQ_HL_REQUIRED_BY": _state_tint(alt, "#58a6ff", 0.22),
+        "FILE_WIN": _state_tint(alt, "#7ee787", 0.22),
+        "FILE_LOSE": _state_tint(alt, "#ff7b72", 0.22),
+        "FILE_ANCHOR": _state_tint(alt, "#e3b341", 0.22),
+        "FILE_DIM": _blend(alt, col(QPalette.WindowText), 0.12),
+        "PLUGIN_CYCLE_ANCHOR": _state_tint(alt, "#e3b341", 0.22),
+        "PLUGIN_CYCLE_OK_BG": _state_tint(alt, "#7ee787", 0.22),
+        "PLUGIN_CYCLE_WARN_BG": _state_tint(alt, "#e3b341", 0.22),
+        "PLUGIN_CYCLE_ERR_BG": _state_tint(alt, "#ff7b72", 0.22),
+        "HIGHLIGHT_DRAG": _blend(accent, win, 0.35),
+        # Separator / boundary bands (the [Overwrite] (N) bars)
+        "BG_SEP": _blend(win, alt, 0.5),
+        "OVERWRITE_SEP_BG": _state_tint(alt, "#e3b341", 0.16),
+        "ROOT_SEP_BG": _state_tint(alt, "#58a6ff", 0.16),
+        # ---- paired foregrounds: computed from the band they sit on ------
+        "TEXT_SEP": contrast_text(_blend(win, alt, 0.5)),
+        "OVERWRITE_SEP_FG": contrast_text(_state_tint(alt, "#e3b341", 0.16)),
+        "ROOT_SEP_FG": contrast_text(_state_tint(alt, "#58a6ff", 0.16)),
+        "PLUGIN_CYCLE_OK_FG": contrast_text(_state_tint(alt, "#7ee787", 0.22)),
+        "PLUGIN_CYCLE_WARN_FG": contrast_text(_state_tint(alt, "#e3b341", 0.22)),
+        "PLUGIN_CYCLE_ERR_FG": contrast_text(_state_tint(alt, "#ff7b72", 0.22)),
     }
     # Semantic status colours: deliberately theme-independent (a success
     # green must not repaint with the desktop) but must stay legible on the
@@ -291,6 +339,25 @@ _SEMANTIC_CONSTANTS = {
     "RED_HOV": "#f85149",
     "CHECK_FILL": "#2ea043",
     "DROPDOWN_ARROW": "#8b949e",
+    # Semantic foregrounds + action fills: stable by design (status colours
+    # must not repaint with the desktop; consumers pair them with a computed
+    # contrasting background or use them on the theme's surfaces).
+    "TEXT_OK": "#7ee787",
+    "TEXT_WARN": "#e3b341",
+    "TEXT_ERR": "#ff7b72",
+    "TEXT_ERR_BRIGHT": "#ff7b72",
+    "TEXT_WHITE": "#ffffff",
+    "TONE_GREEN": "#7ee787",
+    "TONE_RED": "#ff7b72",
+    "TONE_CYAN": "#56b6c2",
+    "TONE_BLUE_SOFT": "#58a6ff",
+    "PLUGIN_CYCLE_LINK": "#58a6ff",
+    "STATUS_BADGE_RED": "#d73a49",
+    "BTN_DANGER": "#d73a49",
+    "BTN_DANGER_HOV": "#f85149",
+    "BTN_INFO": "#1f6feb",
+    "BTN_WARN": "#9e6a03",
+    "BTN_WARN_HOV": "#b8860b",
 }
 
 # These values are baked into paths to pre-tinted PNGs and therefore are not

@@ -434,6 +434,10 @@ class ModRowDelegate(QStyledItemDelegate):
             else:
                 sep_band = self.c_sep_bg
                 p.fillRect(r, _sep_gradient(sep_band, r))
+            if sep_text is None:
+                # Same readability rule as rows: the band's text is computed
+                # from the band actually painted (2026-10-06).
+                sep_text = QColor(_contrasting_text_color(sep_band.name()))
             if index.column() == COL_NAME:
                 self._paint_separator(p, r, e, index, sep_text, sep_band)
             p.restore()
@@ -444,25 +448,40 @@ class ModRowDelegate(QStyledItemDelegate):
         selected = bool(opt.state & QStyle.State_Selected)
         hl = index.data(HighlightRole) or 0
         highlighted = False
+        band = self.c_sel
         if selected:
-            p.fillRect(r, self.c_sel)
+            p.fillRect(r, band)
         elif hl == 2:
-            p.fillRect(r, self.c_hl_anchor); highlighted = True
+            band = self.c_hl_anchor; highlighted = True
+            p.fillRect(r, band)
         elif hl == 3:
-            p.fillRect(r, self.c_hl_requires); highlighted = True
+            band = self.c_hl_requires; highlighted = True
+            p.fillRect(r, band)
         elif hl == -3:
-            p.fillRect(r, self.c_hl_required_by); highlighted = True
+            band = self.c_hl_required_by; highlighted = True
+            p.fillRect(r, band)
         elif hl == 1:
-            p.fillRect(r, self.c_hl_higher); highlighted = True
+            band = self.c_hl_higher; highlighted = True
+            p.fillRect(r, band)
         elif hl == -1:
-            p.fillRect(r, self.c_hl_lower); highlighted = True
+            band = self.c_hl_lower; highlighted = True
+            p.fillRect(r, band)
         elif opt.state & QStyle.State_MouseOver:
-            p.fillRect(r, self.c_hover)
+            band = self.c_hover
+            p.fillRect(r, band)
         else:
-            p.fillRect(r, self.c_row_alt if index.row() % 2 else self.c_row)
+            band = self.c_row_alt if index.row() % 2 else self.c_row
+            p.fillRect(r, band)
 
-        text_color = (self.c_text_on_sel if (selected or highlighted)
-                      else (self.c_text if e.enabled else self.c_text_dim))
+        # Readability rule (KDE pairing, 2026-10-06): a second contrasting
+        # background carries a COMPUTED contrasting foreground - a light state
+        # tint met the fixed selection white and the text went unreadable.
+        if selected:
+            text_color = self.c_text_on_sel
+        elif highlighted:
+            text_color = QColor(_contrasting_text_color(band.name()))
+        else:
+            text_color = self.c_text if e.enabled else self.c_text_dim
 
         if index.column() == COL_NAME:
             self._paint_name(p, r, e, index, text_color)
