@@ -8,6 +8,11 @@ mechanism the Tk app uses.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from gui_qt.theme_keys import ThemeKey
+
 from pathlib import Path
 import re
 import weakref
@@ -103,6 +108,8 @@ class _ThemeValue(str):
     same old colour and diverge in the new theme.
     """
 
+    theme_key: str
+    theme_transform: str
     def __new__(cls, value: str, key: str, transform: str = "direct"):
         obj = super().__new__(cls, value)
         obj.theme_key = key
@@ -482,6 +489,8 @@ def bind_theme(owner, updater: Callable | None = None, *,
         _theme_bindings.pop(key, None)
 
     owner_ref = weakref.ref(owner, _gone)
+    kind: str
+    stored: object
     if updater is None:
         kind, stored = "name", "refresh_theme"
     elif getattr(updater, "__self__", None) is owner:
@@ -497,7 +506,7 @@ def bind_theme(owner, updater: Callable | None = None, *,
     _invoke_theme_binding(owner, kind, stored, active_palette())
 
 
-def bind_theme_icon(owner, name: str, size: int, key: str, *,
+def bind_theme_icon(owner, name: str, size: int, key: "ThemeKey", *,
                     degrees: int | None = None) -> None:
     """Keep a button/action icon tinted from a semantic palette role."""
     def _update(target, palette, icon_name=name, px=size, role=key,
@@ -732,7 +741,7 @@ def _connect_system_scheme_listener() -> None:
     _system_listener_connected = True
 
 
-def _c(pal: dict, key: str) -> str:
+def _c(pal: dict, key: "ThemeKey") -> str:
     val = pal.get(key)
     if val is None:
         # Missing key: derive from the THEME (the old hardcoded dark #1a1a1a
@@ -772,7 +781,11 @@ def _render_theme_tokens(stylesheet: str, pal: dict, *,
 
 
 def _theme_value(pal: dict, key: str, transform: str = "direct") -> str:
-    value = _c(pal, key)
+    from typing import cast
+    # Dynamic-key escape hatch: the render machinery rebuilds values from
+    # parsed QSS tags (runtime strings). Static call sites must use _c()
+    # directly so mypy checks their ThemeKey literals.
+    value = _c(pal, cast("ThemeKey", key))
     if transform == "contrast":
         return contrast_text(value)
     if transform == "lighten":
@@ -795,7 +808,7 @@ def _replace_cached_palette_refs(owner, old: dict | None, new: dict, *,
     except (TypeError, RuntimeError):
         return
     for name, value in list(attrs.items()):
-        replacement = None
+        replacement: object = None
         if value is old:
             replacement = new
         elif (isinstance(value, _ThemeValue)
@@ -1607,7 +1620,7 @@ def contrast_text(bg: str, dark: str = "#101010", light: str = "#ffffff") -> str
     return value
 
 
-def qc(pal: dict, key: str) -> "QColor":
+def qc(pal: dict, key: "ThemeKey") -> "QColor":
     """QColor for palette *key* - shorthand for ``QColor(_c(pal, key))``,
     the incantation every delegate __init__ repeats per colour."""
     from PySide6.QtGui import QColor
@@ -1633,7 +1646,7 @@ def _contrast_ratio(a: str, b: str) -> float:
     return (hi + 0.05) / (lo + 0.05)
 
 
-def link_on(pal: dict, bg_key: str, text_key: str = "TEXT_MAIN",
+def link_on(pal: dict, bg_key: "ThemeKey", text_key: "ThemeKey" = "TEXT_MAIN",
             min_ratio: float = 2.2, min_vs_text: float = 1.8) -> "QColor":
     """QColor for "this text is clickable" on the *bg_key* fill.
 
@@ -1690,7 +1703,7 @@ def _mix(a: str, b: str, factor: float) -> str:
     return "#%02x%02x%02x" % tuple(out)
 
 
-def qc_contrast(pal: dict, key: str) -> "QColor":
+def qc_contrast(pal: dict, key: "ThemeKey") -> "QColor":
     """Auto-contrasted text QColor for the fill at palette *key* (shorthand
     for ``QColor(contrast_text(_c(pal, key)))``)."""
     from PySide6.QtGui import QColor
@@ -1701,10 +1714,10 @@ def qc_contrast(pal: dict, key: str) -> "QColor":
 CLOSE_BTN_SIZE = (90, 30)
 
 
-def button_qss(key: str, *, hover_key: str | None = None,
-               text_key: str | None = None,
-               disabled_bg_key: str = "BTN_GREY",
-               disabled_fg_key: str = "TEXT_DIM",
+def button_qss(key: "ThemeKey", *, hover_key: "ThemeKey | None" = None,
+               text_key: "ThemeKey | None" = None,
+               disabled_bg_key: "ThemeKey" = "BTN_GREY",
+               disabled_fg_key: "ThemeKey" = "TEXT_DIM",
                pal: dict | None = None,
                padding: str = "8px 24px") -> str:
     """Return a palette-driven ``QPushButton`` stylesheet string.

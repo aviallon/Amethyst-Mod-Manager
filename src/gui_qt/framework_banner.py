@@ -9,6 +9,11 @@ widget only maps each state to the matching theme colors.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from gui_qt.theme_keys import ThemeKey
+
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QWidget, QVBoxLayout, QLabel
 
@@ -22,7 +27,10 @@ ROW_H = 22
 # state → (bg palette key, fg palette key). Dedicated FRAMEWORK_* keys (their own
 # "Framework detection" section in the theme editor); seeded from the same colours
 # the shared tinted rows used, but independently editable.
-_STATE_COLORS = {
+# Typed as (ThemeKey, ThemeKey) so mypy rejects keys that the theme does not
+# declare - this table's keys are consumed through VARIABLES and were
+# invisible to call-site scans (white-on-white banner, 2026-10-06).
+_STATE_COLORS: "dict[str, tuple[ThemeKey, ThemeKey]]" = {
     STATE_INSTALLED:    ("FRAMEWORK_INSTALLED_BG", "FRAMEWORK_INSTALLED_FG"),
     STATE_NOT_DEPLOYED: ("FRAMEWORK_STAGED_BG",    "FRAMEWORK_STAGED_FG"),
     STATE_NOT_ENABLED:  ("FRAMEWORK_DISABLED_BG",  "FRAMEWORK_DISABLED_FG"),
