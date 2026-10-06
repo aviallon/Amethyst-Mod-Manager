@@ -204,6 +204,9 @@ _SYSTEM_QSS_EXPRESSIONS = {
     # 2026-10-05).
     "BG_PANEL": "palette(button)",
     "CHECK_FILL": "palette(accent)",   # checkboxes follow the accent
+    "SCROLL_TROUGH": "palette(window)",
+    "SCROLL_BG": "palette(mid)",
+    "SCROLL_ACTIVE": "palette(accent)",
     "TEXT_FAINT": "palette(placeholder-text)",
     "LINK_BLUE": "palette(link)",
     "ACCENT": "palette(accent)",
@@ -257,13 +260,15 @@ def derive_platform_tokens() -> dict:
         "TEXT_ON_ACCENT": col(QPalette.HighlightedText),
         "TEXT_DIM": _blend(col(QPalette.WindowText), win, 0.45),
         "TEXT_FAINT": col(QPalette.PlaceholderText),
-        "BG_PANEL": col(QPalette.ToolTipBase),
         "LINK_BLUE": col(QPalette.Link),
         "ACCENT": accent,
         "ACCENT_HOV": _blend(accent, col(QPalette.WindowText), 0.25),
         "BORDER": col(QPalette.Mid),
         "BORDER_FAINT": col(QPalette.Light),
         "BORDER_DIM": col(QPalette.Midlight),
+        "SCROLL_TROUGH": win,
+        "SCROLL_BG": _blend(win, col(QPalette.WindowText), 0.22),
+        "SCROLL_ACTIVE": accent,
     }
     # Semantic status colours: deliberately theme-independent (a success
     # green must not repaint with the desktop) but must stay legible on the
@@ -272,7 +277,6 @@ def derive_platform_tokens() -> dict:
         # fill ONLY keys no palette role can provide - derived values win
         # (CHECK_FILL follows the accent in platform mode, 2026-10-05)
         p.setdefault(key, value)
-        p[key] = value
     return p
 
 
@@ -443,6 +447,7 @@ def system_theme_id() -> str:
 _system_listener_connected = False
 _applied_system_theme_id: str | None = None
 _in_retheme = False
+_retheme_pending = False
 
 
 def _maybe_retheme_for_system() -> None:
@@ -460,22 +465,43 @@ def _maybe_retheme_for_system() -> None:
     that apply_theme never calls setPalette/setStyle in system mode and so
     cannot re-emit ApplicationPaletteChange itself.
     """
-    global _applied_system_theme_id, _in_retheme
+    global _applied_system_theme_id, _in_retheme, _retheme_pending
     if get_appearance_mode() != "system":
         return
-    if _in_retheme:
+    # COALESCE bursts: Plasma's accent picker can push a palette event per
+    # hover/selection, and a full QSS rebuild + repolish per event freezes the
+    # UI ("not responding", reported 2026-10-06). One deferred retheme per
+    # burst; and when the derived tokens are unchanged the work is skipped
+    # entirely, which also breaks any event ping-pong.
+    from PySide6.QtCore import QTimer
+    if _retheme_pending:
         return
-    from PySide6.QtGui import QGuiApplication
-    app = QGuiApplication.instance()
-    if app is None:
-        return
-    _in_retheme = True
-    try:
-        invalidate_palette_cache()
-        apply_theme(app)
-        _applied_system_theme_id = system_theme_id()
-    finally:
-        _in_retheme = False
+    _retheme_pending = True
+
+    def _run() -> None:
+        global _applied_system_theme_id, _in_retheme, _retheme_pending
+        _retheme_pending = False
+        if get_appearance_mode() != "system" or _in_retheme:
+            return
+        from PySide6.QtGui import QGuiApplication
+        app = QGuiApplication.instance()
+        if app is None:
+            return
+        try:
+            fresh = derive_platform_tokens()
+        except Exception:
+            fresh = None
+        if fresh is not None and fresh == _active_palette_cache:
+            return
+        _in_retheme = True
+        try:
+            invalidate_palette_cache()
+            apply_theme(app)
+            _applied_system_theme_id = system_theme_id()
+        finally:
+            _in_retheme = False
+
+    QTimer.singleShot(50, _run)
 
 
 class _SystemSchemeWatcher:
