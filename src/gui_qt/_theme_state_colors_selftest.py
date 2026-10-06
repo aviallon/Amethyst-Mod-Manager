@@ -62,25 +62,43 @@ def set_platform_palette(app, m: dict) -> None:
 
 
 def consumed_keys() -> dict[str, set[str]]:
-    pat = re.compile(r"(?:qc|qc_contrast|_c|c|ct|cf)\(p,\s*['\"]([A-Z_]+)['\"]")
+    pat = re.compile(r"(?:qc|qc_contrast|_c)\(p,\s*['\"]([A-Z_]+)['\"]")
+    # lambda callers: c = lambda k: _c(p, k) then c('KEY') / ct('KEY')
+    pat2 = re.compile(r"\b(?:c|ct|cf)\(\s*['\"]([A-Z_]+)['\"]")
     out: dict[str, set[str]] = {}
     for f in (Path(__file__).resolve().parents[1] / "gui_qt").rglob("*.py"):
         if "_selftest" in f.name:
             continue
-        for m in pat.finditer(f.read_text()):
+        text = f.read_text()
+        for m in pat.finditer(text):
             out.setdefault(m.group(1), set()).add(f.name)
+        for m in pat2.finditer(text):
+            out.setdefault(m.group(1), set()).add(f.name)
+    # GROUND TRUTH for indirection (variable-key call sites like the
+    # framework banner's _STATE_COLORS tables): the Theme Editor lists every
+    # theme key that exists - all of them must be derivable.
+    te = (Path(__file__).resolve().parents[1] / "gui_qt" /
+          "theme_editor_groups.py").read_text()
+    for k in re.findall(r'"([A-Z][A-Z0-9_]{3,})"', te):
+        if "_" in k:
+            out.setdefault(k, set()).add("theme_editor_groups.py")
     return out
 
 
-# The second-contrast-background surfaces (the KDE AlternateBackground family).
+# Subtle second backgrounds (the KDE AlternateBase family).
 BAND_KEYS = (
-    "CONFLICT_HL_WIN", "CONFLICT_HL_LOSE", "CONFLICT_HL_ANCHOR",
-    "REQ_HL_REQUIRES", "REQ_HL_REQUIRED_BY",
-    "FILE_WIN", "FILE_LOSE", "FILE_ANCHOR", "FILE_DIM",
-    "BG_GREEN_ROW", "BG_HOVER", "BG_SEP",
+    "BG_SEP",
     "OVERWRITE_SEP_BG", "ROOT_SEP_BG",
     "PLUGIN_CYCLE_ANCHOR", "PLUGIN_CYCLE_OK_BG",
     "PLUGIN_CYCLE_WARN_BG", "PLUGIN_CYCLE_ERR_BG",
+)
+
+# Strong highlight rows (user recipe 2026-10-06): winner = accent, loser =
+# 80% accent + 20% row bg; must CONTRAST with the normal row (>= 2.5:1).
+STRONG_KEYS = (
+    "CONFLICT_HL_WIN", "CONFLICT_HL_LOSE",
+    "CONFLICT_HL_ANCHOR", "REQ_HL_REQUIRES", "REQ_HL_REQUIRED_BY",
+    "FILE_WIN", "FILE_LOSE", "FILE_ANCHOR", "BG_GREEN_ROW",
 )
 
 
@@ -107,27 +125,55 @@ def main() -> int:
                     f"[{name}] all {len(used)} consumed tokens are derived "
                     f"(missing: {missing or 'none'})")
 
-        # 2. family - band lightness stays near AlternateBase's
+        # 2. family - subtle bands stay near AlternateBase's lightness
         alt_l = QColor(plat["alt"]).lightness()
         far = {k: (QColor(tok[k]).lightness(), alt_l)
                for k in BAND_KEYS
                if k in tok and abs(QColor(tok[k]).lightness() - alt_l) > 30}
         ok &= claim(not far,
-                    f"[{name}] all {len(BAND_KEYS)} state bands stay in the "
-                    f"AlternateBase family (|dl| <= 30; far: {far or 'none'})")
+                    f"[{name}] subtle bands stay in the AlternateBase family "
+                    f"(|dl| <= 30; far: {far or 'none'})")
+
+        # 2b. strength - highlight rows CONTRAST with the normal row (the
+        # "not contrasted enough" complaint, encoded)
+        row_c = QColor(tok["BG_ROW"])
+        weak = {k: round(_contrast_ratio(QColor(tok[k]), row_c), 2)
+                for k in STRONG_KEYS
+                if k in tok and _contrast_ratio(QColor(tok[k]), row_c) < 1.35}
+        ok &= claim(not weak,
+                    f"[{name}] highlight rows contrast >= 1.35 with the row "
+                    f"(weak: {weak or 'none'})")
+
+        # 2c. recipe (user's exact words): loser = 80% accent + 20% row bg
+        if name == "dark":
+            want = theme_qt._blend(plat["base"], tok["ACCENT"], 0.8)
+            ok &= claim(tok["CONFLICT_HL_LOSE"].lower() == want,
+                        f"loser = 80% accent + 20% row bg "
+                        f"({tok['CONFLICT_HL_LOSE']} == {want})")
+            ok &= claim(tok["CONFLICT_HL_WIN"].lower() == tok["ACCENT"].lower(),
+                        f"winner = the accent colour ({tok['CONFLICT_HL_WIN']})")
 
         # 3. pairing - computed foreground reaches WCAG >= 4.5 on each band
         bad = {}
-        for k in BAND_KEYS + ("TEXT_SEP",):
+        for k in BAND_KEYS + STRONG_KEYS:
             bg = tok.get(k)
-            if not bg or k == "TEXT_SEP":
+            if not bg:
                 continue
             fg = _contrasting_text_color(bg)
             ratio = _contrast_ratio(QColor(fg), QColor(bg))
             if ratio < 4.5:
                 bad[k] = round(ratio, 2)
+        # explicit BG/FG pairs (framework banner, tag chips) must hold too
+        for bg_k, fg_k in (("FRAMEWORK_INSTALLED_BG", "FRAMEWORK_INSTALLED_FG"),
+                           ("FRAMEWORK_STAGED_BG", "FRAMEWORK_STAGED_FG"),
+                           ("FRAMEWORK_DISABLED_BG", "FRAMEWORK_DISABLED_FG"),
+                           ("FRAMEWORK_MISSING_BG", "FRAMEWORK_MISSING_FG"),
+                           ("TAG_BUNDLED_BG", "TAG_BUNDLED_FG")):
+            ratio = _contrast_ratio(QColor(tok[fg_k]), QColor(tok[bg_k]))
+            if ratio < 4.5:
+                bad[fg_k] = round(ratio, 2)
         ok &= claim(not bad,
-                    f"[{name}] every band's computed text reaches WCAG >= 4.5 "
+                    f"[{name}] every band's text reaches WCAG >= 4.5 "
                     f"(below: {bad or 'none'})")
 
     print(f"== {'ALL CLAIMS HOLD' if ok else 'FAILURES PRESENT'}")
