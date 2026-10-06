@@ -115,7 +115,6 @@ def main() -> int:
     QCoreApplication.sendEvent(app, QEvent(QEvent.ApplicationPaletteChange))
     flush(app)
     css_b = app.styleSheet()
-    tok_b = theme_qt.derive_platform_tokens()
     ok &= claim(css_b != css_a, "stylesheet re-derived after the live palette flip")
     ok &= claim(theme_qt._blend(LIGHT["base"], LIGHT["highlight"], 0.16).lower()
                 in hexes(css_b),

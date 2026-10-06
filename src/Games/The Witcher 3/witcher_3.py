@@ -36,7 +36,7 @@ from pathlib import Path
 
 from Games.base_game import BaseGame
 from Utils.vfs import ProfileVFSGameMixin
-from Utils.deployment import LinkMode, cleanup_custom_deploy_dirs, load_per_mod_strip_prefixes, load_separator_deploy_paths, expand_separator_deploy_paths, expand_separator_raw_deploy, _resolve_nocase, _resolve_root_path, _write_deploy_snapshot, _move_runtime_files, _FILEMAP_SNAPSHOT_NAME
+from Utils.deployment import LinkMode, cleanup_custom_deploy_dirs, load_separator_deploy_paths, expand_separator_deploy_paths, expand_separator_raw_deploy, _resolve_nocase, _resolve_root_path, _write_deploy_snapshot, _move_runtime_files, _FILEMAP_SNAPSHOT_NAME
 from Utils.mods.modlist import read_modlist
 from Utils.config_paths import get_profiles_dir
 from Utils.witcher3.menu_filelists import update_menu_filelists
@@ -300,12 +300,10 @@ class Witcher3(ProfileVFSGameMixin, BaseGame):
         custom_exclude = self._deploy_custom_routing_rules(mode, log_fn)
 
         profile_dir        = self.get_profile_root() / "profiles" / profile
-        per_mod_strip      = load_per_mod_strip_prefixes(profile_dir)
         _sep_deploy = load_separator_deploy_paths(profile_dir)
         _sep_entries = read_modlist(profile_dir / "modlist.txt") if _sep_deploy else []
         per_mod_deploy = expand_separator_deploy_paths(_sep_deploy, _sep_entries)
         per_mod_raw = expand_separator_raw_deploy(_sep_deploy, _sep_entries)
-        overwrite_dir      = staging.parent / "overwrite"
         vanilla_backup_dir = game_path / _VANILLA_BACKUP_DIR
 
         # Load any existing manifest so we can distinguish previously-deployed
@@ -328,7 +326,6 @@ class Witcher3(ProfileVFSGameMixin, BaseGame):
         linked    = 0
         skipped   = 0
         backed_up = 0
-        nocase_cache: dict[Path, dict[str, list[Path]]] = {}
         _dst_dir_cache: dict[str, dict[str, "str | list[str]"]] = {}
         # Track files placed in THIS deploy run so that duplicate filemap
         # entries routing to the same destination don't back each other up.

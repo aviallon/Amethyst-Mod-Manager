@@ -11,9 +11,8 @@ from __future__ import annotations
 
 from html import escape
 
-from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
-    QWidget, QHBoxLayout, QLabel, QPushButton, QTextEdit,
+    QWidget, QHBoxLayout, QLabel, QTextEdit,
 )
 
 from gui_qt.overlay_base import OverlayBase

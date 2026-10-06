@@ -1263,7 +1263,7 @@ class GameCandidateAdapter:
                     mod_key,
                 )
             self._archive_units.append((rank, unique_archive))
-            for offset, member in enumerate(paths, 1):
+            for _offset, member in enumerate(paths, 1):
                 member = str(member).replace("\\", "/").lstrip("/")
                 full = self._join(data_prefix, member)
                 candidates.append({

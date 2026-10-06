@@ -283,7 +283,6 @@ class ProfileGroupsView(QWidget):
         return panel
 
     def _build_create_panel(self) -> QFrame:
-        p = active_palette()
         panel = QFrame(); panel.setObjectName("GroupRow")
         pl = QVBoxLayout(panel); pl.setContentsMargins(10, 8, 10, 8); pl.setSpacing(6)
         lbl = QLabel(self.tr("New group")); lbl.setObjectName("PGSection")

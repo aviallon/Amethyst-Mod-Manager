@@ -1098,7 +1098,7 @@ class ModListModel(ModGrouping, QAbstractTableModel):
         timing = ConflictTimeline("toggle", candidates)
         phase_started = timing.now()
         changed: list[tuple[str, bool]] = []
-        for r, e in enumerate(self._entries):
+        for _r, e in enumerate(self._entries):
             if e.is_separator or e.locked:
                 continue
             if e.enabled != enabled:

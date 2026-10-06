@@ -384,7 +384,7 @@ class PluginModel(QAbstractTableModel):
         src = sorted({i for i in src_rows if 0 <= i < len(self._rows)})
         if not src or src[-1] - src[0] != len(src) - 1:
             return self._first_movable(), len(self._rows)
-        first, last = src[0], src[-1]
+        first = src[0]
         span = len(src)
         lo = self._clamp_dest(src, 0)
         hi = self._clamp_dest(src, len(self._rows))

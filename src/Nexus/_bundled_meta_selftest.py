@@ -24,7 +24,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from Nexus.nexus_meta import (  # noqa: E402
-    NexusModMeta, bundled_meta_from_archive, meta_from_ini_text)
+    bundled_meta_from_archive, meta_from_ini_text)
 
 RICH_INI = """[General]
 gamename = skyrimspecialedition

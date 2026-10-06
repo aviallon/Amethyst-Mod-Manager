@@ -1,0 +1,44 @@
+name: Lint
+
+on:
+  push:
+    branches: [main, "viallon/**"]
+  pull_request:
+
+jobs:
+  lint:
+    name: ruff + mypy + theme-keys
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install linters
+        run: pip install ruff mypy
+      - name: Theme-key static lint (AST)
+        run: python3 src/gui_qt/_theme_keys_lint.py
+      - name: ruff
+        run: ruff check src/
+      - name: mypy
+        run: mypy src/
+
+  theme-selftests:
+    name: theme selftests (offscreen render)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install Qt bindings
+        run: pip install PySide6
+      - name: Run the four theme suites
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          for t in _theme_state_colors_selftest _theme_live_switch_selftest \
+                   _theme_platform_render_selftest _theme_system_selftest; do
+            echo "== $t"
+            python3 "src/gui_qt/$t.py"
+          done

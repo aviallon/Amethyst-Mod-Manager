@@ -631,7 +631,9 @@ def _log_connection_diagnostics() -> None:
 
     # 1. Environment basics
     try:
-        import ssl, platform, sys
+        import ssl
+        import platform
+        import sys
         app_log(f"OAuth diagnostics: python={sys.version.split()[0]} "
                 f"openssl={ssl.OPENSSL_VERSION} platform={platform.platform()}")
         app_log(f"OAuth diagnostics: requests={requests.__version__}")
@@ -673,7 +675,8 @@ def _log_connection_diagnostics() -> None:
 
     # 4. System curl comparison (uses the OS cert store, like the user's manual test)
     try:
-        import subprocess, shutil
+        import subprocess
+        import shutil
         if shutil.which("curl"):
             proc = subprocess.run(
                 ["curl", "-sS", "-o", "/dev/null", "-w",

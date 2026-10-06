@@ -1,0 +1,83 @@
+[tool.ruff]
+target-version = "py313"
+line-length = 120
+src = ["src"]
+
+[tool.ruff.lint]
+# Bug-focused selection: pyflakes + pycodestyle essentials + bugbear.
+# Style-migration rules (isort, pyupgrade, formatting) are deliberately NOT
+# selected: they would churn thousands of legacy lines without catching bugs.
+select = [
+    "E4",   # pycodestyle: imports
+    "E7",   # pycodestyle: statements
+    "E9",   # pycodestyle: runtime errors (syntax)
+    "F",    # pyflakes: undefined names, unused imports/vars, duplicate keys
+    "B",    # flake8-bugbear: real bug patterns
+]
+ignore = [
+    # --- disclosed debt, not hidden -------------------------------------
+    "B023",   # loop-variable capture: 29 sites, all closures invoked within
+              # their iteration (measured 2026-10-06). Latent risk if any is
+              # ever deferred; list with:
+              #   ruff check --select B023 --output-format=concise src/
+    "B905",   # zip(..., strict=): a semantic decision per call site (70),
+              # not a lint auto-fix. Enabling later is a deliberate pass.
+    "B007",   # unused loop-control variable: 19 sites, readability only.
+              # List with: ruff check --select B007 --output-format=concise src/
+    # --- project idioms -------------------------------------------------
+    "E702",   # multiple statements on one line (';'): 458 legacy one-liners
+    "E731",   # lambda assignment: idiomatic in the QSS token builder
+    "E741",   # ambiguous names (l, O): maths/geometry code
+    "E402",   # module import not at top: the app deliberately lazy-imports
+              # Qt/heavy modules inside functions for startup time
+    "B008",   # function call in default argument: used deliberately for
+              # Qt factory defaults
+    "B027",   # empty method without @abstractmethod: interface stubs
+    "B904",   # raise-without-from: 4 sites, stylistic
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Selftests install sys.path shims and duplicate small helpers on purpose.
+"src/**/_*_selftest.py" = ["B005"]
+
+[tool.mypy]
+python_version = "3.13"
+mypy_path = "src"
+explicit_package_bases = true
+namespace_packages = true
+ignore_missing_imports = true
+follow_imports = "silent"
+warn_unused_configs = true
+# Game-handler folders are loaded through importlib and carry names that are
+# not valid Python packages ("7 Days to Die", "The Witcher 3", ...): mypy
+# cannot resolve them as modules. Checked manually when touched.
+exclude = ['src/Games/(?:[^/]* .*|[0-9].*)/']
+
+# ---------------------------------------------------------------------------
+# Typing ratchet (measured 2026-10-06: 1562 errors across 232 modules of
+# pre-existing debt). The typed surface below is ENFORCED (0 errors); the
+# legacy packages are listed explicitly so the debt is visible and shrinkable.
+# When a package gets typed, remove its line and keep it green.
+# First matching section wins: the enforced modules come first.
+# ---------------------------------------------------------------------------
+[[tool.mypy.overrides]]
+module = [
+    "gui_qt.theme_keys",
+    "gui_qt.theme_qt",
+    "gui_qt.framework_banner",
+]
+ignore_errors = false
+
+[[tool.mypy.overrides]]
+module = [
+    "Utils.*",
+    "Games.*",
+    "LOOT.*",
+    "Nexus.*",
+    "cli.*",
+    "gui_qt.*",
+    "themes.*",
+    "wizards_qt.*",
+    "wrappers.*",
+]
+ignore_errors = true

@@ -83,11 +83,11 @@ class TkStyleHeader(QHeaderView):
                 # Draw the section chrome with the decoration suppressed so the
                 # native left-aligned icon doesn't show under our centered one.
                 painter.save()
-                setattr(model, "_suppress_header_deco", True)
+                model._suppress_header_deco = True
                 try:
                     super().paintSection(painter, rect, logicalIndex)
                 finally:
-                    setattr(model, "_suppress_header_deco", False)
+                    model._suppress_header_deco = False
                 painter.restore()
                 sz = 14
                 pm = deco.pixmap(sz, sz)
@@ -110,10 +110,10 @@ class TkStyleHeader(QHeaderView):
         model = self.model()
         painter.save()
         try:
-            setattr(model, "_suppress_header_text", True)
+            model._suppress_header_text = True
             super().paintSection(painter, rect, logicalIndex)
         finally:
-            setattr(model, "_suppress_header_text", False)
+            model._suppress_header_text = False
             painter.restore()
         text = model.headerData(logicalIndex, Qt.Horizontal, Qt.DisplayRole)
         text = "" if text is None else str(text)
