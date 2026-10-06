@@ -91,6 +91,14 @@ def spread(img, x0, y0, x1, y1) -> float:
     return (max(vals) - min(vals)) if vals else 0.0
 
 
+def flush(app, ms=250) -> None:
+    """Pump the Qt event loop so the DEBOUNCED retheme (50ms timer) runs."""
+    import time
+    end = time.time() + ms / 1000
+    while time.time() < end:
+        app.processEvents()
+
+
 def main() -> int:
     from PySide6.QtCore import QEvent, QCoreApplication
     from PySide6.QtWidgets import QApplication
@@ -131,6 +139,7 @@ def main() -> int:
     # ---- LIVE flip to light platform ------------------------------------
     set_platform_palette(app, LIGHT)
     QCoreApplication.sendEvent(app, QEvent(QEvent.ApplicationPaletteChange))
+    flush(app)
     img_b = grab()
     bg_b = lightness(img_b, 5, 5, 355, 20)
     txt_b = lightness(img_b, tx0, ty0, tx1, ty1)
@@ -145,6 +154,7 @@ def main() -> int:
     # ---- Flip back: rendering matches A again ---------------------------
     set_platform_palette(app, DARK)
     QCoreApplication.sendEvent(app, QEvent(QEvent.ApplicationPaletteChange))
+    flush(app)
     img_c = grab()
     bg_c = lightness(img_c, 5, 5, 355, 20)
     ok &= claim(abs(bg_c - bg_a) < 4,
@@ -166,11 +176,13 @@ def main() -> int:
     pal.setColor(QPalette.Accent, QColor("#e06c75"))
     app.setPalette(pal)
     QCoreApplication.sendEvent(app, QEvent(QEvent.ApplicationPaletteChange))
+    flush(app)
     fill1 = checkbox_fill(grab())
     pal = app.palette()
     pal.setColor(QPalette.Accent, QColor("#56b6c2"))
     app.setPalette(pal)
     QCoreApplication.sendEvent(app, QEvent(QEvent.ApplicationPaletteChange))
+    flush(app)
     fill2 = checkbox_fill(grab())
     ok &= claim(fill1 == "#e06c75",
                 f"checkbox fill = the accent colour (got {fill1}, want #e06c75)")
