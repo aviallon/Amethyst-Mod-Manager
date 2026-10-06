@@ -53,7 +53,7 @@ def set_platform_palette(app, m: dict) -> None:
 
 def render_gallery():
     """A representative mini-UI: window label + list row + accent button."""
-    from PySide6.QtWidgets import QWidget, QLabel, QVBoxLayout, QPushButton, QListWidget
+    from PySide6.QtWidgets import QWidget, QLabel, QVBoxLayout, QPushButton, QListWidget, QCheckBox
     w = QWidget()
     w.setObjectName("GalleryRoot")
     lay = QVBoxLayout(w)
@@ -68,9 +68,13 @@ def render_gallery():
     btn = QPushButton("Next")
     btn.setObjectName("GalleryAccent")
     lay.addWidget(btn)
-    w.resize(360, 240)
+    cb = QCheckBox("follows the accent")
+    cb.setChecked(True)
+    cb.setObjectName("GalleryCheck")
+    lay.addWidget(cb)
+    w.resize(360, 280)
     w.show()
-    return w, title, lw, btn
+    return w, title, lw, btn, cb
 
 
 def lightness(img, x0, y0, x1, y1) -> float:
@@ -101,7 +105,7 @@ def main() -> int:
     set_platform_palette(app, DARK)
     theme_qt.invalidate_palette_cache()
     theme_qt.apply_theme(app)
-    w, title, lw, btn = render_gallery()
+    w, title, lw, btn, cb = render_gallery()
     w.show()
     app.processEvents()
 
@@ -145,6 +149,33 @@ def main() -> int:
     bg_c = lightness(img_c, 5, 5, 355, 20)
     ok &= claim(abs(bg_c - bg_a) < 4,
                 f"flip back restores rendering A (bg {bg_c:.1f} vs {bg_a:.1f})")
+
+    # ---- accent -> checkbox live propagation (reported 2026-10-05) -----
+    from PySide6.QtGui import QPalette, QColor
+    cb.show()
+    app.processEvents()
+
+    def checkbox_fill(img):
+        top = cb.mapTo(w, cb.rect().topLeft())
+        cy = top.y() + cb.height() // 2
+        cx = top.x() + 3           # fill area at the left of the 16px indicator
+        # (dx=10 would sample the white check glyph itself - measured 2026-10-05)
+        return img.pixelColor(cx, cy).name().lower()
+
+    pal = app.palette()
+    pal.setColor(QPalette.Accent, QColor("#e06c75"))
+    app.setPalette(pal)
+    QCoreApplication.sendEvent(app, QEvent(QEvent.ApplicationPaletteChange))
+    fill1 = checkbox_fill(grab())
+    pal = app.palette()
+    pal.setColor(QPalette.Accent, QColor("#56b6c2"))
+    app.setPalette(pal)
+    QCoreApplication.sendEvent(app, QEvent(QEvent.ApplicationPaletteChange))
+    fill2 = checkbox_fill(grab())
+    ok &= claim(fill1 == "#e06c75",
+                f"checkbox fill = the accent colour (got {fill1}, want #e06c75)")
+    ok &= claim(fill2 == "#56b6c2",
+                f"accent change reaches the checkbox LIVE (got {fill2}, want #56b6c2)")
 
     print(f"== {'ALL CLAIMS HOLD' if ok else 'FAILURES PRESENT'}")
     return 0 if ok else 1
