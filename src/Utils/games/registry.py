@@ -13,7 +13,6 @@ from Utils.games.discovery import discover_games
 from Utils.wizards.plugins import discover_plugins
 from Utils.profiles.state import (
     merge_profile_settings,
-    profile_uses_specific_mods,  # re-exported: backend now imports from Utils
     read_profile_settings,
     write_profile_settings,
 )

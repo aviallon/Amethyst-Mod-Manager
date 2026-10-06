@@ -35,7 +35,6 @@ from Utils.deployment.shared import (
     _map_batched,
     _mkdir_leaves,
     _move_crash_safe,
-    _path_under_root,
     _resolve_root_path_str,
     _timer,
     _timing_print,
@@ -702,9 +701,6 @@ def deploy_filemap(
 
     _overwrite_str = str(overwrite_dir)
     _staging_str   = str(staging_root)
-    sorted_strip   = sorted(_strip) if _strip else []
-    nocase_cache: dict[Path, dict[str, list[Path]]] = {}
-    mod_index_cache: dict[Path, dict[str, Path]] = {}
 
     _t_resolve_start = _time.perf_counter()
     from Utils.filegraph.deploy import entries as filegraph_entries

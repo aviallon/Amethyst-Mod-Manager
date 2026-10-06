@@ -1,0 +1,32 @@
+#!/bin/sh
+# Pre-commit hook - tracked in .githooks/ and activated once per clone with:
+#     git config core.hooksPath .githooks
+# Bypass with:  LINT_SKIP=1 git commit ...
+#
+# Runs the three layers from fastest to slowest:
+#   1. theme-key static lint (pure python, no deps, <1s)
+#   2. ruff (real-bug ruleset, see pyproject.toml)
+#   3. mypy (typing ratchet, see pyproject.toml)
+set -e
+[ -n "$LINT_SKIP" ] && { echo "lint: skipped (LINT_SKIP=1)"; exit 0; }
+cd "$(git rev-parse --show-toplevel)"
+
+echo "lint: theme keys (static AST)..."
+python3 src/gui_qt/_theme_keys_lint.py >/dev/null
+echo "lint: theme keys OK"
+
+tool() {  # tool <name> <args...>: local install, else nix shell
+    if command -v "$1" >/dev/null 2>&1; then
+        "$@"
+    elif command -v nix >/dev/null 2>&1; then
+        nix shell "nixpkgs#$1" -c "$@"
+    else
+        echo "lint: $1 introuvable (installé ni localement ni via nix) - IGNORÉ" >&2
+    fi
+}
+
+echo "lint: ruff..."
+tool ruff check src/
+echo "lint: mypy..."
+tool mypy src/
+echo "lint: OK"

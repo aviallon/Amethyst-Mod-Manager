@@ -1756,9 +1756,9 @@ class UE5Game(ProfileVFSGameMixin, BaseGame):
         vfs_external_mods: set[str] = set()
 
         if getattr(self, "_vfs_ue5_populating", False):
-            source_game = Path(getattr(self, "_vfs_ue5_source_game_root"))
-            source_data = Path(getattr(self, "_vfs_ue5_source_data_root"))
-            target_root = Path(getattr(self, "_vfs_ue5_outer_layer"))
+            source_game = Path(self._vfs_ue5_source_game_root)
+            source_data = Path(self._vfs_ue5_source_data_root)
+            target_root = Path(self._vfs_ue5_outer_layer)
             mapped: dict[str, Path] = {}
             external_mods: set[str] = set()
             for mod_name, raw_target in per_mod_deploy.items():
@@ -1812,13 +1812,11 @@ class UE5Game(ProfileVFSGameMixin, BaseGame):
                 log_fn=_log,
                 prefix_root=self.get_prefix_path(),
             )
-        overwrite_dir = staging.parent / "overwrite"
         # Filemap entries for the overwrite folder carry strip-normalised
-        # paths while the folder itself holds deployed-layout paths - a
-        # direct join misses them (e.g. "ue4ss/..." vs the on-disk
-        # "Binaries/Win64/ue4ss/...").  Index it once up front.
-        overwrite_lookup = _build_overwrite_lookup(
-            overwrite_dir, self.mod_folder_strip_prefixes)
+        # paths while the folder itself holds deployed-layout paths. The
+        # resolver above now receives strip_prefixes= directly, so the old
+        # standalone lookup is not needed anymore (removed 2026-10-06, was
+        # built and never consulted - flagged by ruff F841).
 
         manifest: list[str] = []
         vanilla_backup_dir = (
@@ -1926,10 +1924,9 @@ class UE5Game(ProfileVFSGameMixin, BaseGame):
         def _journal_external_target(target: Path, mod_name: str) -> None:
             if not (is_vfs_build and mod_name in vfs_external_mods):
                 return
-            journal_path = Path(getattr(
-                self, "_vfs_ue5_external_journal_path"))
+            journal_path = Path(self._vfs_ue5_external_journal_path)
             destination_line = str(target)
-            journaled = getattr(self, "_vfs_ue5_external_journal_entries")
+            journaled = self._vfs_ue5_external_journal_entries
             if destination_line in journaled:
                 return
             with journal_path.open("a", encoding="utf-8") as stream:
@@ -2090,8 +2087,7 @@ class UE5Game(ProfileVFSGameMixin, BaseGame):
                             # recovery. The temporary mirror is disposable
                             # while os.replace publishes the completed copy
                             # atomically on the same profile filesystem.
-                            backup_temp_root = Path(getattr(
-                                self, "_vfs_ue5_custom_backup_temp_dir"))
+                            backup_temp_root = Path(self._vfs_ue5_custom_backup_temp_dir)
                             backup_temp = backup_temp_root / rel_abs
                             backup_temp.parent.mkdir(
                                 parents=True, exist_ok=True)

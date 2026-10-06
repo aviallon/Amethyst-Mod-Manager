@@ -1273,7 +1273,7 @@ def run_collection_install(
             links = api.get_download_links(
                 game_domain=mod_domain, mod_id=effective_mod_id,
                 file_id=_resolved_file_id(mod))
-        except Exception as exc:
+        except Exception:
             if _use_prefer_fallback(mod):
                 cached = _cached_archive_for(mod, mod_domain)
                 if cached is not None:

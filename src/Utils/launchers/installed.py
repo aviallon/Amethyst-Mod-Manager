@@ -102,7 +102,7 @@ class InstalledIndex:
         self._acf_dirs: dict[str, list[Path]] = {}
 
         for common in libraries:
-            for low, (name, is_file) in self._listing(common).items():
+            for _low, (name, is_file) in self._listing(common).items():
                 if not is_file:
                     self._steam_game_dirs.append(common / name)
             steamapps = common.parent

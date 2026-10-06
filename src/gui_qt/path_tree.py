@@ -12,7 +12,7 @@ optional right-aligned ``source`` label and an opaque ``payload`` for the host.
 from __future__ import annotations
 
 from PySide6.QtCore import Qt, QModelIndex, QAbstractItemModel, QRect
-from PySide6.QtGui import QColor, QFont
+from PySide6.QtGui import QFont
 from PySide6.QtWidgets import QStyledItemDelegate
 
 from gui_qt.theme_qt import bind_theme, _c, qc

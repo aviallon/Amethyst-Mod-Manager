@@ -20,7 +20,6 @@ that case the page shows the upstream one-liner to run on the host instead.
 from __future__ import annotations
 
 import threading
-from pathlib import Path
 from typing import TYPE_CHECKING
 
 from PySide6.QtCore import Qt, Signal

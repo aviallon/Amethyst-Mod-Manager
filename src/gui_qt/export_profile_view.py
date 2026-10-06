@@ -23,8 +23,7 @@ from PySide6.QtCore import (
 )
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QPlainTextEdit,
-    QPushButton, QTableWidget, QTableWidgetItem, QCheckBox, QHeaderView,
-    QFrame, QRadioButton, QButtonGroup, QListWidget,
+    QPushButton, QTableWidget, QTableWidgetItem, QCheckBox, QFrame, QRadioButton, QButtonGroup, QListWidget,
     QListWidgetItem, QAbstractItemView,
 )
 

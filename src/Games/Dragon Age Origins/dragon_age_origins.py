@@ -475,7 +475,7 @@ class DragonAgeOrigins(BaseGame):
         import os
         _log = log_fn or (lambda _: None)
         keep = {"Settings", "Logs"}
-        for dirpath, dirnames, filenames in os.walk(data_root, topdown=False):
+        for dirpath, _dirnames, _filenames in os.walk(data_root, topdown=False):
             p = Path(dirpath)
             if p == data_root:
                 continue

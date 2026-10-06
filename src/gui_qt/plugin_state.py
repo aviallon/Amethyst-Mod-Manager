@@ -1114,7 +1114,7 @@ class RequirementResolver:
             base = exe.replace("\\", "/").rsplit("/", 1)[-1].lower()
             if base in root_files:
                 return True
-            rel = exe.replace("\\", "/").lstrip("./").lstrip("../").lower()
+            rel = exe.replace("\\", "/").lstrip("./").lstrip("../").lower()  # noqa: B005 -- intentional char-class trim (leading ./ and ../ runs)
             if (self._staged_contains(rel)
                     or self._staged_contains(base, basename=True)):
                 return True
@@ -1125,7 +1125,7 @@ class RequirementResolver:
         """True if a LOOT requirement entry is met in the current profile."""
         m = _FILENAME_REQ_RE.match(raw)
         if m:
-            inner = m.group(1).replace("\\", "/").lstrip("./").lstrip("../")
+            inner = m.group(1).replace("\\", "/").lstrip("./").lstrip("../")  # noqa: B005 -- intentional char-class trim (leading ./ and ../ runs)
             inner_lower = inner.lower()
             if inner_lower in self._enabled_lower:
                 return True
@@ -1570,7 +1570,7 @@ def format_loot_tooltip(info: dict, enabled_lower: set[str]) -> str:
             display = r.get("display_name") or raw
             m = _FILENAME_RE.match(raw)
             fname = m.group(1) if m else raw
-            fname_lower = fname.replace("\\", "/").lstrip("./").lstrip("../").lower()
+            fname_lower = fname.replace("\\", "/").lstrip("./").lstrip("../").lower()  # noqa: B005 -- intentional char-class trim (leading ./ and ../ runs)
             if fname_lower in enabled_lower:
                 continue
             dm = _FILENAME_RE.match(display)
@@ -1592,7 +1592,7 @@ def format_loot_tooltip(info: dict, enabled_lower: set[str]) -> str:
             display = i.get("display_name") or raw
             m = _FILENAME_RE.match(raw)
             fname = m.group(1) if m else raw
-            fname_lower = fname.lower().lstrip("./").lstrip("../")
+            fname_lower = fname.lower().lstrip("./").lstrip("../")  # noqa: B005 -- intentional char-class trim (leading ./ and ../ runs)
             if fname_lower not in enabled_lower:
                 continue
             dm = _FILENAME_RE.match(display)

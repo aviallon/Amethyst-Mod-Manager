@@ -27,7 +27,6 @@ from PySide6.QtWidgets import (
     QSplitter, QTextBrowser, QToolButton,
 )
 
-from gui_qt.safe_emit import safe_emit
 from gui_qt.theme_qt import active_palette, bind_theme, _c
 from gui_qt.worker import run_in_worker
 from Utils.github import wiki as wiki_sync

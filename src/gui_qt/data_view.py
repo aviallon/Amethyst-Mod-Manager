@@ -433,7 +433,6 @@ class DataView(QWidget):
             projection_started = time.perf_counter()
             try:
                 resolved = self._resolved_entries()
-                entries = [(path, mod) for _candidate_id, path, mod in resolved]
                 contested = set()
                 if (snapshot is not None
                         and self._resolved_contested_generation

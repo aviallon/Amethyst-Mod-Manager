@@ -487,7 +487,8 @@ def _keyring_ok() -> bool:
 
 def _derive_key() -> bytes:
     """Derive a Fernet key from the machine ID so keys are only usable on this device."""
-    import base64, hashlib
+    import base64
+    import hashlib
     machine_id = ""
     for p in ("/etc/machine-id", "/var/lib/dbus/machine-id"):
         try:
@@ -521,7 +522,8 @@ def _load_key_file() -> str:
 def _save_key_file(key: str) -> None:
     """Save API key to encrypted file fallback."""
     from cryptography.fernet import Fernet
-    import json as _json, os as _os
+    import json as _json
+    import os as _os
     p = _api_key_file_path()
     p.parent.mkdir(parents=True, exist_ok=True)
     cipher = Fernet(_derive_key())

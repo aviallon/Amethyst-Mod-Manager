@@ -28,7 +28,6 @@ from Utils.deployment.shared import (
     _move_crash_safe,
     _path_under_root,
     _prune_empty_dirs,
-    _resolve_nocase,
     _resolve_root_path,
     _restore_backup_dir,
     _timing_print,

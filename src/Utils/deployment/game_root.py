@@ -16,7 +16,6 @@ from Utils.app_log import safe_log as _safe_log
 from Utils.deployment.shared import (
     LinkMode,
     _FILEMAP_SNAPSHOT_NAME,
-    _OVERWRITE_NAME,
     _do_link,
     _iter_map_batched,
     _log_case_collisions,
@@ -122,9 +121,6 @@ def deploy_filemap_to_root(
 
     _overwrite_str = str(overwrite_dir)
     _staging_str   = str(staging_root)
-    sorted_strip   = sorted(_strip) if _strip else []
-    nocase_cache: dict[Path, dict[str, list[Path]]] = {}
-    mod_index_cache: dict[Path, dict[str, str]] = {}
     _mod_root_cache: dict[str, Path] = {}
     # String-based caches for _resolve_root_path_str
     _game_root_str = str(game_root)

@@ -653,7 +653,7 @@ class ModListView(QTreeView):
         flt = self._filter_hidden
         srch = self._search_hidden
         query_hidden = set(flt | srch if self._searching else flt)
-        for leader, rows in self.model()._group_rows().items():
+        for _leader, rows in self.model()._group_rows().items():
             if any(r not in query_hidden for r in rows):
                 query_hidden.discard(rows[0])
         if self._searching:

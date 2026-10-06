@@ -1110,9 +1110,6 @@ def decode_manifest(code: str) -> dict:
 # The transport lives in Utils/paste_upload.py (the log panel uploads through it
 # too). These wrappers keep the code-flavoured names and defaults.
 
-from Utils.sharing.paste import (            # noqa: E402  (kept beside its users)
-    PASTE_HOST, RETENTION_NOTE, is_url as is_code_url,
-)
 
 
 def upload_code(code: str, *, timeout: float = 30.0) -> str:

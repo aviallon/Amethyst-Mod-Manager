@@ -703,7 +703,7 @@ def write_ba2_textures(
     total_phase = len(tx_files) * 2
     done = 0
 
-    for (dir_back, leaf, ext, abs_path), rk in zip(tx_files, tx_rel_keys):
+    for (dir_back, leaf, _ext, abs_path), rk in zip(tx_files, tx_rel_keys):
         if cancel is not None and cancel():
             raise Ba2WriteError("cancelled")
         try:

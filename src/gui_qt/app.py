@@ -8035,7 +8035,8 @@ class MainWindow(QMainWindow):
             rev_hint = read_collection_revision(pdir) or rev_hint
         domain = url_domain or domain
 
-        import threading, json
+        import threading
+        import json
 
         def worker():
             res = {"error": "unknown"}
@@ -9167,7 +9168,7 @@ class MainWindow(QMainWindow):
 
         api = getattr(self, "_nexus_api", None)
         opened = 0
-        for (nm, domain, mod_id, file_id, f, installed_meta,
+        for (nm, domain, mod_id, _file_id, f, installed_meta,
              installed_ts_meta) in enriched:
             dl_key = self._new_dl_key()
             self._nexus_download_progress(dl_key, nm, 0, 0)  # show popup card
@@ -12596,7 +12597,6 @@ class MainWindow(QMainWindow):
         btn = getattr(self, "_exe_settings_btn", None)
         if btn is None:
             return
-        game = self._gs.game
         session = getattr(self, "_play_session", None)
         running = session is not None and session.active
 

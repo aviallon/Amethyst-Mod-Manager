@@ -31,7 +31,6 @@ from Utils.deployment.shared import (
     _move_crash_safe,
     _prune_empty_dirs,
     _resolve_root_path,
-    _resolve_source,
     _restore_backup_dir,
 )
 
@@ -754,8 +753,6 @@ def deploy_custom_rules(
     overwrite_dir = staging_root.parent / "overwrite"
     _overwrite_str = str(overwrite_dir)
     _staging_str   = str(staging_root)
-    nocase_cache: dict[Path, dict[str, list[Path]]] = {}
-    sorted_strip   = sorted(_strip) if _strip else []
 
     # Pre-process rules into normalised form for fast matching.
     # Extensions are kept as a list sorted longest-first so that multi-dot

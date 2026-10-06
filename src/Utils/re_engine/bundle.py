@@ -314,7 +314,7 @@ def _common_name_prefix(names: "list[str]") -> str:
             common.append(first)
         else:
             break
-    prefix = " ".join(common).rstrip(" :-_–-|/").strip()
+    prefix = " ".join(common).rstrip(" :-_–-|/").strip()  # noqa: B005 -- intentional char-class trim (leading ./ and ../ runs)
     # Only useful as a label if it actually shortens / shares something.
     return prefix if len(common) >= 1 and prefix else ""
 
