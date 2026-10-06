@@ -243,6 +243,18 @@ def _state_tint(alt_hex: str, hue_hex: str, t: float) -> str:
     return _blend(alt_hex, h.name(), t)
 
 
+def _hue_text(hue_hex: str, bg_hex: str) -> str:
+    """Colored text that is GUARANTEED readable: the semantic hue kept, its
+    lightness re-projected to the contrast pole of its background (what the
+    explicit themes do by hand - dark green text on pastel green in light,
+    bright green on deep green in dark)."""
+    from PySide6.QtGui import QColor
+    pole = QColor(contrast_text(bg_hex))
+    h = QColor(hue_hex)
+    h.setHsv(h.hue(), max(h.saturation(), 120), pole.lightness())
+    return h.name()
+
+
 def derive_platform_tokens() -> dict:
     """Semantic token dict derived from the LIVE platform palette.
 
@@ -291,15 +303,20 @@ def derive_platform_tokens() -> dict:
         # 2026-10-06). Paired foregrounds are computed from the actual band
         # so the text is always readable.
         "BG_HOVER": _blend(alt, col(QPalette.WindowText), 0.08),
-        "BG_GREEN_ROW": _state_tint(alt, "#7ee787", 0.18),
-        "CONFLICT_HL_WIN": _state_tint(alt, "#7ee787", 0.22),
-        "CONFLICT_HL_LOSE": _state_tint(alt, "#ff7b72", 0.22),
-        "CONFLICT_HL_ANCHOR": _state_tint(alt, "#e3b341", 0.22),
-        "REQ_HL_REQUIRES": _state_tint(alt, "#a855f7", 0.22),
-        "REQ_HL_REQUIRED_BY": _state_tint(alt, "#58a6ff", 0.22),
-        "FILE_WIN": _state_tint(alt, "#7ee787", 0.22),
-        "FILE_LOSE": _state_tint(alt, "#ff7b72", 0.22),
-        "FILE_ANCHOR": _state_tint(alt, "#e3b341", 0.22),
+        # Modlist highlight rows (user recipe, 2026-10-06): the WINNER row is
+        # the accent colour (like the selected row), the LOSER row is that same
+        # accent mixed 80% / 20% with the normal row background. Subtle 22%
+        # tints were "not contrasted enough"; the semantic hues stay but at
+        # the same strong 80% mix.
+        "BG_GREEN_ROW": _blend(base, "#7ee787", 0.8),
+        "CONFLICT_HL_WIN": accent,
+        "CONFLICT_HL_LOSE": _blend(base, accent, 0.8),
+        "CONFLICT_HL_ANCHOR": _blend(base, "#e3b341", 0.8),
+        "REQ_HL_REQUIRES": _blend(base, "#a855f7", 0.8),
+        "REQ_HL_REQUIRED_BY": _blend(base, "#58a6ff", 0.8),
+        "FILE_WIN": _blend(base, "#7ee787", 0.8),
+        "FILE_LOSE": _blend(base, "#ff7b72", 0.8),
+        "FILE_ANCHOR": _blend(base, "#e3b341", 0.8),
         "FILE_DIM": _blend(alt, col(QPalette.WindowText), 0.12),
         "PLUGIN_CYCLE_ANCHOR": _state_tint(alt, "#e3b341", 0.22),
         "PLUGIN_CYCLE_OK_BG": _state_tint(alt, "#7ee787", 0.22),
@@ -317,6 +334,52 @@ def derive_platform_tokens() -> dict:
         "PLUGIN_CYCLE_OK_FG": contrast_text(_state_tint(alt, "#7ee787", 0.22)),
         "PLUGIN_CYCLE_WARN_FG": contrast_text(_state_tint(alt, "#e3b341", 0.22)),
         "PLUGIN_CYCLE_ERR_FG": contrast_text(_state_tint(alt, "#ff7b72", 0.22)),
+        # ---- Framework-status banner (the conditional line above the lists,
+        # SKSE/BepInEx/... states) + tag chips + card texts: theme-editor keys
+        # that fell back to white-on-white (reported 2026-10-06).
+        "FRAMEWORK_INSTALLED_BG": _state_tint(alt, "#7ee787", 0.18),
+        "FRAMEWORK_STAGED_BG": _state_tint(alt, "#e3b341", 0.18),
+        "FRAMEWORK_DISABLED_BG": _state_tint(alt, "#58a6ff", 0.18),
+        "FRAMEWORK_MISSING_BG": _state_tint(alt, "#ff7b72", 0.18),
+        "FRAMEWORK_INSTALLED_FG": _hue_text("#7ee787", _state_tint(alt, "#7ee787", 0.18)),
+        "FRAMEWORK_STAGED_FG": _hue_text("#e3b341", _state_tint(alt, "#e3b341", 0.18)),
+        "FRAMEWORK_DISABLED_FG": _hue_text("#58a6ff", _state_tint(alt, "#58a6ff", 0.18)),
+        "FRAMEWORK_MISSING_FG": _hue_text("#ff7b72", _state_tint(alt, "#ff7b72", 0.18)),
+        "TAG_BUNDLED_BG": _state_tint(alt, "#1a5c8a", 0.15),
+        "TAG_INSTALLED_BG": _state_tint(alt, "#7ee787", 0.15),
+        "TAG_BUNDLED_FG": _hue_text("#1a5c8a", _state_tint(alt, "#1a5c8a", 0.15)),
+        "TAG_UNORDERED_FG": _hue_text("#888888", base),
+        "TAG_FOLDER": _hue_text("#1e7a8a", base),
+        "TAG_BSA": _hue_text("#8a6a00", base),
+        "TAG_BSA_ALT": _hue_text("#1e7a8a", base),
+        "TAG_INI_PROFILE": _hue_text("#006a80", base),
+        "TEXT_CARD": col(QPalette.WindowText),
+        "TEXT_CARD_MED": _blend(col(QPalette.WindowText), win, 0.35),
+        "TEXT_CARD_DIM": _blend(col(QPalette.WindowText), win, 0.6),
+        "TEXT_MUTED": _blend(col(QPalette.WindowText), win, 0.6),
+        "TEXT_TREE_FG": col(QPalette.WindowText),
+        "TONE_BLUE": _hue_text("#1e5a8a", base),
+        "TONE_FLAG": _hue_text("#a06a00", base),
+        # ---- cards / entries / overlays / colored panels (theme-editor keys) -
+        "BG_CARD": base,
+        "BG_CARD_ALT": alt,
+        "BG_ENTRY": base,
+        "BG_SELECT_BAR": _state_tint(alt, "#58a6ff", 0.22),
+        "BG_HOVER_ROW": _blend(base, col(QPalette.WindowText), 0.08),
+        "BG_MOD_OPT": _state_tint(alt, "#58a6ff", 0.14),
+        "BG_MOD_REQ": _state_tint(alt, "#7ee787", 0.3),
+        "BG_OVERLAY_DEEP": _blend(win, col(QPalette.WindowText), 0.10),
+        "BG_OVERLAY_ERR": _blend(win, "#ff7b72", 0.22),
+        "BG_GREEN_DEEP": _state_tint(alt, "#7ee787", 0.25),
+        "BG_RED_DEEP": _state_tint(alt, "#ff7b72", 0.25),
+        "BG_ORANGE_DEEP": _state_tint(alt, "#e3b341", 0.25),
+        "BG_BLUE_DEEP": _state_tint(alt, "#58a6ff", 0.25),
+        "BG_DARK_BLUE": _blend(base, "#58a6ff", 0.7),
+        "BG_DARK_GREEN": _blend(base, "#7ee787", 0.7),
+        "BG_GREEN_TEXT": _hue_text("#7ee787", _state_tint(alt, "#7ee787", 0.25)),
+        "BG_RED_TEXT": _hue_text("#ff7b72", _state_tint(alt, "#ff7b72", 0.25)),
+        "BG_ORANGE_TEXT": _hue_text("#e3b341", _state_tint(alt, "#e3b341", 0.25)),
+        "BG_BLUE_TEXT": _hue_text("#58a6ff", _state_tint(alt, "#58a6ff", 0.25)),
     }
     # Semantic status colours: deliberately theme-independent (a success
     # green must not repaint with the desktop) but must stay legible on the
@@ -353,11 +416,45 @@ _SEMANTIC_CONSTANTS = {
     "TONE_BLUE_SOFT": "#58a6ff",
     "PLUGIN_CYCLE_LINK": "#58a6ff",
     "STATUS_BADGE_RED": "#d73a49",
+    "STATUS_BADGE_GREEN": "#2ea043",
+    "STATUS_SUCCESS_SOLID": "#2ea74d",
+    "STATUS_QUEUED": "#c37800",
+    "STATUS_DL_GREEN": "#2e8e40",
+    "TEXT_BLACK": "#111111",
     "BTN_DANGER": "#d73a49",
     "BTN_DANGER_HOV": "#f85149",
     "BTN_INFO": "#1f6feb",
+    "BTN_INFO_HOV": "#388bfd",
     "BTN_WARN": "#9e6a03",
     "BTN_WARN_HOV": "#b8860b",
+    # Action-fill family (buttons): semantic, stable by design.
+    "BG_BTN_SAVE": "#5a5a9a",
+    "BTN_CANCEL": "#c0392b",
+    "BTN_CANCEL_HOV": "#a93226",
+    "BTN_DANGER_ALT": "#a83232",
+    "BTN_DANGER_ALT_HOV": "#8b1a1a",
+    "BTN_DANGER_DEEP": "#8b1a1a",
+    "BTN_DANGER_DEEP_HOV": "#7a1a1a",
+    "BTN_SUCCESS_ALT": "#3a8a3d",
+    "BTN_SUCCESS_ALT_HOV": "#2e6b30",
+    "BTN_SUCCESS_DEEP": "#369150",
+    "BTN_SUCCESS_DEEP_HOV": "#2a6e3f",
+    "BTN_WARN_DEEP": "#a07800",
+    "BTN_WARN_DEEP_HOV": "#7a5a00",
+    "BTN_WARN_BROWN": "#7a5200",
+    "BTN_WARN_BROWN_HOV": "#5a3a00",
+    "BTN_WARN_ORANGE": "#d97000",
+    "BTN_WARN_ORANGE_HOV": "#b35a00",
+    "BTN_INFO_DEEP": "#2070a8",
+    "BTN_INFO_DEEP_HOV": "#1a5a8a",
+    "BTN_PURPLE": "#8957e5",
+    "BTN_PURPLE_HOV": "#7c3aed",
+    "BTN_GREY": "#6b7280",
+    "BTN_GREY_HOV": "#555c66",
+    "BTN_GREY_ALT": "#7a8290",
+    "BTN_GREY_ALT_HOV": "#646b76",
+    "BTN_NEUTRAL": "#4a5568",
+    "BTN_NEUTRAL_HOV": "#3a4454",
 }
 
 # These values are baked into paths to pre-tinted PNGs and therefore are not
