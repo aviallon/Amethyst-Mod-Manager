@@ -198,7 +198,12 @@ _SYSTEM_QSS_EXPRESSIONS = {
     "BG_HEADER": "palette(button)",
     "BG_SELECT": "palette(highlight)",
     "TEXT_ON_ACCENT": "palette(highlighted-text)",
-    "BG_PANEL": "palette(tooltip-base)",
+    # Raised surfaces (menus, panels, bottom bar, selected tab) map to the
+    # BUTTON role. The earlier tooltip-base mapping gave tooltip colours to
+    # menus and the selected tab - visibly incoherent on Plasma (reported
+    # 2026-10-05).
+    "BG_PANEL": "palette(button)",
+    "CHECK_FILL": "palette(accent)",   # checkboxes follow the accent
     "TEXT_FAINT": "palette(placeholder-text)",
     "LINK_BLUE": "palette(link)",
     "ACCENT": "palette(accent)",
@@ -240,6 +245,8 @@ def derive_platform_tokens() -> dict:
         _PLATFORM_DERIVED: "1",
         "BG_DEEP": win,
         "BG_MAIN": win,
+        "BG_PANEL": col(QPalette.Button),
+        "CHECK_FILL": accent,   # checkboxes follow the ACCENT, not a fixed green
         "TEXT_MAIN": col(QPalette.WindowText),
         "BG_LIST": base,
         "BG_ROW": base,
@@ -262,6 +269,9 @@ def derive_platform_tokens() -> dict:
     # green must not repaint with the desktop) but must stay legible on the
     # current surfaces - derived contrast picks the label colour.
     for key, value in _SEMANTIC_CONSTANTS.items():
+        # fill ONLY keys no palette role can provide - derived values win
+        # (CHECK_FILL follows the accent in platform mode, 2026-10-05)
+        p.setdefault(key, value)
         p[key] = value
     return p
 
@@ -432,32 +442,40 @@ def system_theme_id() -> str:
 
 _system_listener_connected = False
 _applied_system_theme_id: str | None = None
+_in_retheme = False
 
 
 def _maybe_retheme_for_system() -> None:
-    """Re-theme on a PLATFORM palette/scheme change while mode is 'system'.
+    """Re-theme on ANY platform palette/scheme change while mode is 'system'.
 
     Called from BOTH delivery channels: QStyleHints.colorSchemeChanged AND the
     application-level ApplicationPaletteChange/ThemeChange events (what Plasma
-    actually sends on a desktop theme switch - the native palette propagates
-    even when colorSchemeChanged never fires, which left inline QSS colours
-    stale against fresh palette surfaces: unreadable mixed rendering).
-    Loop-safe: apply_theme records the applied id BEFORE touching the
-    palette, so the PaletteChange it provokes resolves to the same id and is
-    ignored.
+    sends on a desktop theme switch - the native palette propagates even when
+    colorSchemeChanged never fires).
+
+    Deliberately NO 'scheme id unchanged' shortcut: Plasma also pushes
+    ACCENT-ONLY palette changes (same dark/light scheme), and the old guard
+    silently swallowed them - the accent only caught up on app restart
+    (reported 2026-10-05). Loop safety: a re-entrancy flag, plus the fact
+    that apply_theme never calls setPalette/setStyle in system mode and so
+    cannot re-emit ApplicationPaletteChange itself.
     """
-    global _applied_system_theme_id
+    global _applied_system_theme_id, _in_retheme
     if get_appearance_mode() != "system":
         return
-    resolved = system_theme_id()
-    if resolved == _applied_system_theme_id:
+    if _in_retheme:
         return
     from PySide6.QtGui import QGuiApplication
     app = QGuiApplication.instance()
     if app is None:
         return
-    invalidate_palette_cache()
-    apply_theme(app)
+    _in_retheme = True
+    try:
+        invalidate_palette_cache()
+        apply_theme(app)
+        _applied_system_theme_id = system_theme_id()
+    finally:
+        _in_retheme = False
 
 
 class _SystemSchemeWatcher:
@@ -879,7 +897,7 @@ def build_qss(pal: dict | None = None) -> str:
         color: {c('TEXT_MAIN')};
     }}
     QTabBar::tab:selected {{
-        background: {c('BG_PANEL')};
+        background: {c('BG_DEEP')};   /* merge with the pane below (folder look) */
         color: {c('TEXT_MAIN')};
         border-bottom: 2px solid {c('ACCENT')};
     }}
