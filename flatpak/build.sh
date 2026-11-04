@@ -62,10 +62,14 @@ echo ""
 
 FB_CMD="$(resolve_flatpak_builder)"
 
+# --disable-rofiles-fuse: rofiles-fuse cannot mount on some local filesystems
+# (bcachefs); it only write-protects the build cache, so it is safe to disable
+# for a local build. The CI uses the flatpak-builder action, not this script.
 $FB_CMD \
   --verbose \
   --user \
   --force-clean \
+  --disable-rofiles-fuse \
   --install-deps-from=flathub \
   --repo="${REPO_DIR}" \
   $INSTALL_FLAG \
