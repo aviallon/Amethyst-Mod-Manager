@@ -1,14 +1,25 @@
 name: Flatpak (viallon channel)
 
-# Internal release tags only:  v<upstream-version>[-<prerelease>]-viallon<N>
+# Internal release tags only:  v<upstream-version>[-<prerelease>]-viallon<N>[.<M>]
 #
-#   v2.4.3-viallon1         -> stable   (a stable publish also lands on beta)
-#   v2.5.0-beta.6-viallon1  -> beta
-#   v2.5.0-rc1-viallon2     -> beta
+#   v2.4.3-viallon1           -> stable   (a stable publish also lands on beta)
+#   v2.5.0-beta.6-viallon1    -> beta
+#   v2.5.0-rc1-viallon2       -> beta
+#   v2.5.0-viallon12.3        -> stable   (automatic runtime rebuild, M bumps)
+#
+# N is the human release counter; the optional .M counter is bumped only by the
+# scheduled runtime-drift rebuild, never by hand.
+#
+# The daily schedule compares the Flathub commits of the PySide BaseApp and the
+# KDE runtime with the ones the last successful build used
+# (.github/flatpak-runtime-pins.json). On drift it rebuilds the newest *stable*
+# release tag against the new base/runtime and republishes it to stable under
+# `viallon<N>.<M+1>`. Use the manual "simulate_schedule" dispatch input to run
+# that exact path on demand.
 #
 # NOTE: upstream classifies with `[[ "$ref" == v*-* ]] -> beta`, which would
-# mis-file `v2.4.3-viallon1` as beta. The classifier below strips the `-viallonN`
-# suffix FIRST and only then looks for a remaining prerelease.
+# mis-file `v2.4.3-viallon1` as beta. The classifier below strips the
+# `-viallonN[.M]` suffix FIRST and only then looks for a remaining prerelease.
 #
 # The build runs here; publishing is delegated to the reusable workflow in
 # aviallon/hub-viallon, which merges the result into the accumulated OSTree repo
@@ -18,6 +29,8 @@ on:
   push:
     tags:
       - 'v*-viallon*'
+  schedule:
+    - cron: '23 4 * * *'
   workflow_dispatch:
     inputs:
       ref:
@@ -35,7 +48,12 @@ on:
         description: Publish to the dry-run Pages branch instead of the live one.
         type: boolean
         default: true
+      simulate_schedule:
+        description: Run the runtime-drift path (as if triggered by the daily schedule).
+        type: boolean
+        default: false
 
+# Least privilege: only `finalize` needs to write (pins commit + tag).
 permissions:
   contents: read
 
@@ -47,40 +65,130 @@ jobs:
       ostree: ${{ steps.c.outputs.ostree }}
       subject: ${{ steps.c.outputs.subject }}
       dry: ${{ steps.c.outputs.dry }}
+      rebuild: ${{ steps.c.outputs.rebuild }}
+      tag: ${{ steps.c.outputs.tag }}
+      build_ref: ${{ steps.c.outputs.build_ref }}
+      build_sha: ${{ steps.c.outputs.build_sha }}
+      base_commit: ${{ steps.pins.outputs.base }}
+      runtime_commit: ${{ steps.pins.outputs.runtime }}
     steps:
-      - name: Classify the tag
+      # Checkout the default branch: this job only needs the tag list and the
+      # pins file, both of which live there (fetch-depth 0 also fetches tags).
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Resolve Flathub base/runtime commits
+        id: pins
+        # A tag release does not depend on the pins: an apt/flathub hiccup must
+        # not block it. The drift path re-checks the values and fails loud.
+        continue-on-error: ${{ github.event_name != 'schedule' }}
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq flatpak
+          flatpak --user remote-add --if-not-exists flathub \
+            https://dl.flathub.org/repo/flathub.flatpakrepo
+          base=$(flatpak remote-info --user --show-commit flathub io.qt.PySide.BaseApp//6.11)
+          rt=$(flatpak remote-info --user --show-commit flathub org.kde.Platform//6.11)
+          echo "PySide BaseApp//6.11 = $base"
+          echo "KDE runtime//6.11    = $rt"
+          echo "base=$base"    >> "$GITHUB_OUTPUT"
+          echo "runtime=$rt" >> "$GITHUB_OUTPUT"
+
+      - name: Classify the event / detect drift
         id: c
         shell: bash
         env:
           EVENT: ${{ github.event_name }}
           REF_NAME: ${{ github.ref_name }}
+          IN_REF: ${{ inputs.ref }}
           IN_CHANNEL: ${{ inputs.channel }}
           IN_DRY: ${{ inputs.dry_run }}
+          IN_SIMULATE: ${{ inputs.simulate_schedule }}
+          REF: ${{ github.ref }}
+          SHA: ${{ github.sha }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          BASE: ${{ steps.pins.outputs.base }}
+          RUNTIME: ${{ steps.pins.outputs.runtime }}
         run: |
           set -euo pipefail
+          out() { echo "$1=$2" >> "$GITHUB_OUTPUT"; }
 
-          if [ "$EVENT" = "workflow_dispatch" ]; then
-            echo "ostree=$IN_CHANNEL" >> "$GITHUB_OUTPUT"
-            echo "subject=$REF_NAME"   >> "$GITHUB_OUTPUT"
-            echo "dry=$IN_DRY"         >> "$GITHUB_OUTPUT"
+          # ---- runtime-drift rebuild (daily schedule, or the simulate input) ----
+          if [ "$EVENT" = "schedule" ] || [ "$IN_SIMULATE" = "true" ]; then
+            if [ -z "$BASE" ] || [ -z "$RUNTIME" ]; then
+              echo "::error::could not resolve the Flathub base/runtime commits"
+              exit 1
+            fi
+            pins=".github/flatpak-runtime-pins.json"
+            pb=$(jq -r '.base // ""' "$pins" 2>/dev/null || echo "")
+            pr=$(jq -r '.runtime // ""' "$pins" 2>/dev/null || echo "")
+            if [ "$pb" = "$BASE" ] && [ "$pr" = "$RUNTIME" ]; then
+              echo "No runtime drift; nothing to rebuild." | tee -a "$GITHUB_STEP_SUMMARY"
+              out rebuild false; out tag ""; out ostree stable; out subject ""; out dry false
+              out build_ref "refs/heads/$DEFAULT_BRANCH"; out build_sha ""
+              exit 0
+            fi
+
+            # Newest STABLE tag only: a prerelease must not divert the runtime
+            # fix away from the stable channel.
+            # `|| true`: under `set -euo pipefail` a non-matching grep would abort
+            # the step before the explicit "no stable tag" error below.
+            latest=$(git for-each-ref --sort=-v:refname --format='%(refname:short)' \
+                       'refs/tags/v*-viallon*' \
+                     | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+-viallon[0-9]+(\.[0-9]+)?$' \
+                     | head -1 || true)
+            if [ -z "$latest" ]; then
+              echo "::error::no stable v<X.Y.Z>-viallon<N>[.M] tag found"
+              exit 1
+            fi
+            base_v="${latest%-viallon*}"
+            vers="${latest##*-viallon}"
+            n="${vers%%.*}"
+            m="${vers#*.}"; [ "$m" = "$vers" ] && m=0
+            m=$((m + 1))
+            next="v${base_v#v}-viallon${n}.${m}"
+            subj="${base_v#v}+viallon${n}.${m}"
+
+            {
+              echo "### Runtime drift rebuild"
+              echo
+              echo "| field | value |"
+              echo "|---|---|"
+              echo "| rebuilt from | \`$latest\` |"
+              echo "| new tag | \`$next\` |"
+              echo "| channel | **stable** |"
+              echo "| BaseApp commit | \`$BASE\` |"
+              echo "| runtime commit | \`$RUNTIME\` |"
+            } >> "$GITHUB_STEP_SUMMARY"
+
+            out rebuild true; out tag "$next"; out ostree stable; out subject "$subj"; out dry "${IN_DRY:-false}"
+            out build_ref "refs/tags/$latest"; out build_sha "$(git rev-parse "refs/tags/$latest^{commit}")"
             exit 0
           fi
 
+          # ---- workflow_dispatch ----
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            out rebuild true; out tag ""; out ostree "$IN_CHANNEL"; out subject "$REF_NAME"
+            out dry "$IN_DRY"; out build_ref "$IN_REF"; out build_sha ""
+            exit 0
+          fi
+
+          # ---- tag push ----
           tag="$REF_NAME"
-
           if [[ "$tag" != *-viallon* ]]; then
-            echo "::error::tag '$tag' must end in -viallon<N>"
+            echo "::error::tag '$tag' must end in -viallon<N>[.<M>]"
             exit 1
           fi
-
           n="${tag##*-viallon}"
-          if [[ ! "$n" =~ ^[1-9][0-9]*$ ]]; then
-            echo "::error::viallon counter must be >= 1, got '$n' in '$tag'"
+          if [[ ! "$n" =~ ^[1-9][0-9]*(\.[1-9][0-9]*)?$ ]]; then
+            echo "::error::viallon counter must be N or N.M (N,M >= 1), got '$n' in '$tag'"
             exit 1
           fi
-
           base="${tag%-viallon*}"
-
           if   [[ "$base" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             ch=stable
           elif [[ "$base" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-.+$ ]]; then
@@ -89,10 +197,6 @@ jobs:
             echo "::error::unrecognised base version '$base' (from '$tag')"
             exit 1
           fi
-
-          echo "ostree=$ch"                    >> "$GITHUB_OUTPUT"
-          echo "subject=${base#v}+viallon${n}" >> "$GITHUB_OUTPUT"
-          echo "dry=false"                     >> "$GITHUB_OUTPUT"
 
           {
             echo "### Flatpak publish"
@@ -106,14 +210,19 @@ jobs:
             echo "| commit subject | \`${base#v}+viallon${n}\` |"
           } >> "$GITHUB_STEP_SUMMARY"
 
+          out rebuild true; out tag ""; out ostree "$ch"; out subject "${base#v}+viallon${n}"
+          out dry false; out build_ref "$REF"; out build_sha "$SHA"
+
   filegraph:
     name: Build filegraph extension
     needs: meta
+    if: needs.meta.outputs.rebuild == 'true'
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ needs.meta.outputs.build_ref }}
+          persist-credentials: false
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -143,6 +252,7 @@ jobs:
   flatpak:
     name: Build Flatpak (${{ needs.meta.outputs.ostree }})
     needs: [meta, filegraph]
+    if: needs.meta.outputs.rebuild == 'true'
     runs-on: ubuntu-latest
     container:
       image: ghcr.io/flathub-infra/flatpak-github-actions:freedesktop-25.08
@@ -154,9 +264,12 @@ jobs:
       # Upstream's own container jobs pass --privileged for the same reason.
       options: --privileged
     steps:
+      # No persisted credentials: this job executes third-party build code in a
+      # --privileged container, so it must not carry a writable git token.
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ needs.meta.outputs.build_ref }}
+          persist-credentials: false
 
       - uses: actions/download-artifact@v4
         with:
@@ -165,13 +278,14 @@ jobs:
 
       - name: Stamp the fork version into src/version.py (option A)
         # The app's displayed/checked version carries the fork revision:
-        # '<base>+viallon<N>' (PEP 440 local - _parse_version ignores the
+        # '<base>+viallon<N>[.<M>]' (PEP 440 local - _parse_version ignores the
         # suffix, so upstream update checks stay on the base).
+        env:
+          VER: ${{ needs.meta.outputs.subject }}
         run: |
           set -euo pipefail
-          ver='${{ needs.meta.outputs.subject }}'
-          if [ -n "$ver" ]; then
-            sed -i "s/^__version__ = .*/__version__ = \"$ver\"/" src/version.py
+          if [ -n "$VER" ]; then
+            sed -i "s/^__version__ = .*/__version__ = \"$VER\"/" src/version.py
           else
             echo "no subject (dry run) - keeping the committed version"
           fi
@@ -194,7 +308,9 @@ jobs:
         with:
           manifest-path: flatpak/io.github.Amethyst.ModManager.yml
           branch: ${{ needs.meta.outputs.ostree }}
-          cache-key: flatpak-builder-v2-${{ hashFiles('flatpak/io.github.Amethyst.ModManager.yml', 'flatpak/pypi-dependencies.yaml', 'flatpak/maturin.yaml', 'flatpak/Cargo.lock', 'flatpak/cargo-sources.json') }}
+          # Include the base/runtime commits so a drift rebuild cannot reuse a
+          # cached build made against the previous PySide6/Qt.
+          cache-key: flatpak-builder-v3-${{ hashFiles('flatpak/io.github.Amethyst.ModManager.yml', 'flatpak/pypi-dependencies.yaml', 'flatpak/maturin.yaml', 'flatpak/Cargo.lock', 'flatpak/cargo-sources.json') }}-${{ needs.meta.outputs.base_commit }}-${{ needs.meta.outputs.runtime_commit }}
 
       - uses: actions/upload-artifact@v4
         with:
@@ -206,6 +322,7 @@ jobs:
   publish:
     name: Publish to hub-viallon
     needs: [meta, flatpak]
+    if: needs.meta.outputs.rebuild == 'true'
     uses: aviallon/hub-viallon/.github/workflows/publish-flatpak.yml@main
     with:
       app-id: io.github.Amethyst.ModManager
@@ -224,3 +341,60 @@ jobs:
       # hub-viallon. An SSH deploy key (write access on hub-viallon only) is
       # stored here as HUB_VIALLON_DEPLOY_KEY.
       hub-deploy-key: ${{ secrets.HUB_VIALLON_DEPLOY_KEY }}
+
+  finalize:
+    name: Record runtime pins / tag the rebuild
+    needs: [meta, publish]
+    if: needs.meta.outputs.rebuild == 'true' && needs.meta.outputs.dry != 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # push the pins commit and the automatic tag
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # A tag-triggered or drift run would otherwise be on a detached HEAD,
+          # where the pins commit cannot be pushed.
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
+
+      # Only after a *successful* publish: a failed build must not advance the
+      # pins, or the next schedule would consider the drift already handled.
+      - name: Record the base/runtime commits used
+        env:
+          BASE: ${{ needs.meta.outputs.base_commit }}
+          RUNTIME: ${{ needs.meta.outputs.runtime_commit }}
+        run: |
+          set -euo pipefail
+          if [ -z "$BASE" ] || [ -z "$RUNTIME" ]; then
+            echo "::warning::base/runtime commits unknown; leaving the pins unchanged"
+            exit 0
+          fi
+          mkdir -p .github
+          jq -n --arg base "$BASE" --arg runtime "$RUNTIME" \
+            '{base: $base, runtime: $runtime}' > .github/flatpak-runtime-pins.json
+          cat .github/flatpak-runtime-pins.json
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .github/flatpak-runtime-pins.json
+          git diff --cached --quiet || git commit -m "chore(flatpak): pin runtime commits used by the last build"
+          git push
+
+      # The auto tag below matches the `v*-viallon*` push trigger, but it is
+      # pushed with GITHUB_TOKEN and GitHub never starts a run for a GITHUB_TOKEN
+      # push — that, not this workflow, is what prevents a loop/double build. If
+      # the token is ever swapped for a PAT/App token, add an explicit
+      # `if: github.actor != 'github-actions[bot]'` guard on the build jobs.
+      - name: Tag the automatic rebuild (viallonN.M), if any
+        if: needs.meta.outputs.tag != ''
+        env:
+          TAG: ${{ needs.meta.outputs.tag }}
+          SHA: ${{ needs.meta.outputs.build_sha }}
+        run: |
+          set -euo pipefail
+          if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+            echo "tag $TAG already exists; nothing to do"
+            exit 0
+          fi
+          git tag "$TAG" "$SHA"
+          git push origin "$TAG"
+          echo "pushed $TAG" | tee -a "$GITHUB_STEP_SUMMARY"
