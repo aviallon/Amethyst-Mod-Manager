@@ -4565,6 +4565,447 @@ def test_flatpak_host_wrap() -> None:
     print("✓ Flatpak host escape remains outside the VFS wrapper")
 
 
+def test_wrap_command_mask_paths() -> None:
+    """Launch masks hide paths in the namespace only; empty masks change nothing."""
+    with tempfile.TemporaryDirectory() as tmp:
+        game = _FakeGame(Path(tmp))
+        state = _write_manifest(game)
+        manifest_path = state / MANIFEST_NAME
+        manifest = json.loads(manifest_path.read_text())
+        view = state / "view"
+        (view / "Data" / "textures").mkdir(parents=True)
+        (view / "Data" / "textures" / "keep.dds").write_text("keep")
+        (view / "Data" / "Masked").mkdir()
+        (view / "Data" / "Masked" / "old.dds").write_text("old")
+        manifest["backend"] = BACKEND_SHADOW
+        manifest["view_root"] = str(view)
+        manifest_path.write_text(json.dumps(manifest))
+
+        original = ["/bin/true"]
+        quiet = lambda _m: None
+        with patch("Utils.vfs.overlay._inside_flatpak", return_value=False), \
+                patch("Utils.vfs.overlay._bubblewrap_binary",
+                      return_value="bwrap"), \
+                patch("Utils.vfs.overlay._bubblewrap_status",
+                      return_value=(True, "")):
+            plain = wrap_command(game, original, log_fn=quiet)
+            empty = wrap_command(game, original, log_fn=quiet, mask_paths=())
+
+        # An empty mask list must be byte-identical to the unmasked launch.
+        assert plain == empty
+        assert plain == [
+            "bwrap", "--die-with-parent", "--dev-bind", "/", "/",
+            "--bind", str(view), str(game.game),
+            "--", *original,
+        ]
+
+        # Mask mounts land after the view bind, before "--", in request order;
+        # duplicates collapse and absolute spellings under the game root
+        # normalize to the same mounts. A mask whose target does not exist in
+        # the view is SKIPPED with a log line - never created (a --tmpfs on a
+        # missing destination would create it in the view, mutating it).
+        skip_logs: list[str] = []
+        with patch("Utils.vfs.overlay._inside_flatpak", return_value=False), \
+                patch("Utils.vfs.overlay._bubblewrap_binary",
+                      return_value="bwrap"), \
+                patch("Utils.vfs.overlay._bubblewrap_status",
+                      return_value=(True, "")):
+            masked = wrap_command(
+                game, original, log_fn=skip_logs.append,
+                mask_paths=["Data/Masked", game.game / "Data/Missing",
+                            "Data\\Masked"])
+        assert masked == [
+            "bwrap", "--die-with-parent", "--dev-bind", "/", "/",
+            "--bind", str(view), str(game.game),
+            "--tmpfs", str(game.game / "Data/Masked"),
+            "--", *original,
+        ]
+        assert any("Data/Missing" in line and "skipped" in line.lower()
+                   for line in skip_logs), skip_logs
+
+        # A mask that cannot name a path inside the game root fails loud.
+        for bad in ("/somewhere/else/Mod", "../evil", "."):
+            try:
+                with patch("Utils.vfs.overlay._inside_flatpak",
+                           return_value=False):
+                    wrap_command(game, original, log_fn=quiet,
+                                 mask_paths=[bad])
+            except RuntimeError as exc:
+                assert "mask" in str(exc).lower(), str(exc)
+            else:
+                raise AssertionError(f"mask {bad!r} was silently accepted")
+
+        # The kernel-OverlayFS bwrap route carries the same mounts. Its mask
+        # targets live in the MERGED tree (game root + layers + upper): create
+        # real deployed content to hide and layer-only content to cover.
+        manifest["backend"] = BACKEND_KERNEL
+        manifest_path.write_text(json.dumps(manifest))
+        (game.game / "Data" / "Masked").mkdir()
+        (game.game / "Data" / "Masked" / "real.dds").write_text("real")
+        (state / "lower" / "data" / "Layered").mkdir(parents=True)
+        (state / "lower" / "data" / "Layered" / "l.dds").write_text("layer")
+        with patch("Utils.vfs.overlay._bubblewrap_binary",
+                   return_value="bwrap"), \
+                patch("Utils.vfs.overlay.bubblewrap_status",
+                      return_value=(True, "")):
+            kernel_masked = wrap_command(
+                game, original, log_fn=quiet,
+                mask_paths=["Data/Masked", "Data/Layered", "Data/Absent"])
+        tmpfs_index = kernel_masked.index("--tmpfs")
+        assert kernel_masked[tmpfs_index:tmpfs_index + 2] == [
+            "--tmpfs", str(game.game / "Data/Masked")]
+        assert tmpfs_index < kernel_masked.index("--")
+        # A mask must follow EVERY overlay mount: a mutation moving it before
+        # the overlays would let the overlay re-expose the masked content.
+        overlay_indexes = [i for i, token in enumerate(kernel_masked)
+                           if token in ("--overlay", "--overlay-src")]
+        assert overlay_indexes and all(tmpfs_index > i
+                                       for i in overlay_indexes), kernel_masked
+        # Content that only exists in a captured layer still counts as
+        # existing (it shows in the merge); an absent target is skipped.
+        assert ["--tmpfs", str(game.game / "Data/Layered")] in [
+            kernel_masked[i:i + 2] for i in range(len(kernel_masked) - 1)]
+        assert str(game.game / "Data/Absent") not in kernel_masked
+
+        # A backend without a mount namespace must raise naming itself.
+        manifest["backend"] = BACKEND_FUSE
+        manifest_path.write_text(json.dumps(manifest))
+        try:
+            wrap_command(game, original, log_fn=quiet,
+                         mask_paths=["Data/Masked"])
+        except RuntimeError as exc:
+            assert "fuse-overlayfs" in str(exc), str(exc)
+            assert "Masked" in str(exc), str(exc)
+        else:
+            raise AssertionError("fuse-overlayfs backend dropped the masks")
+
+        # Back to the shadow backend for the real bubblewrap run below.
+        manifest["backend"] = BACKEND_SHADOW
+        manifest_path.write_text(json.dumps(manifest))
+
+        # A direct shadow launch route creates no namespace either: masks
+        # must fail loud there while the unmasked launch keeps working.
+        direct_game = _FakeGame(Path(tmp) / "direct")
+        direct_state = _write_manifest(direct_game)
+        direct_manifest_path = direct_state / MANIFEST_NAME
+        direct_manifest = json.loads(direct_manifest_path.read_text())
+        direct_view = direct_state / "view"
+        (direct_view / "Data").mkdir(parents=True)
+        direct_manifest["backend"] = BACKEND_SHADOW
+        direct_manifest["view_root"] = str(direct_view)
+        direct_manifest_path.write_text(json.dumps(direct_manifest))
+        direct_game.vfs_direct_shadow_launch = True
+        with patch("Utils.vfs.overlay._inside_flatpak", return_value=False):
+            direct_plain = wrap_command(direct_game, original, log_fn=quiet)
+            assert direct_plain[-len(original):] == original
+            try:
+                wrap_command(direct_game, original, log_fn=quiet,
+                             mask_paths=["Data/Masked"])
+            except RuntimeError as exc:
+                assert "shadow-tree" in str(exc), str(exc)
+                assert "direct shadow" in str(exc), str(exc)
+            else:
+                raise AssertionError("direct shadow route dropped the masks")
+
+        # Real bubblewrap: the mask hides the deployed copy for the launched
+        # process only. A mask target that does not exist stays nonexistent -
+        # the wrapper never creates it.
+        masked_dir = game.game / "Data" / "Masked"
+        missing_dir = game.game / "Data" / "Missing"
+        script = (
+            f'test -z "$(ls -A {masked_dir})" && '
+            f'test ! -e {masked_dir / "old.dds"} && '
+            f'test -f {game.game / "Data" / "textures" / "keep.dds"} && '
+            f'test ! -e {missing_dir}'
+        )
+        result = subprocess.run(
+            wrap_command(game, ["/bin/sh", "-c", script], log_fn=quiet,
+                         mask_paths=["Data/Masked", "Data/Missing"]),
+            text=True, capture_output=True, check=False)
+        assert result.returncode == 0, result.stderr
+        # The mask is namespace-only: the deployed tree is untouched.
+        assert (view / "Data" / "Masked" / "old.dds").read_text() == "old"
+    print("✓ launch masks hide paths per process and empty masks change nothing")
+
+
+def test_srt_bwrap_mask_insertion() -> None:
+    """srt-bwrap masks both bind spellings, after the binds, before the '--'."""
+    from Utils.vfs.overlay import _bound_shadow_steam_runtime_command
+
+    def _pair_index(tokens: list[str], pair: list[str]) -> int:
+        for i in range(len(tokens) - 1):
+            if tokens[i:i + 2] == pair:
+                return i
+        return -1
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        game_root = root / "game"
+        view = root / "view"
+        bind_root = root / "short"
+        for directory in (game_root, view, bind_root):
+            directory.mkdir()
+        (view / "Data" / "Masked").mkdir(parents=True)
+        (view / "Data" / "Masked" / "old.dds").write_text("old")
+        runtime_root = root / "runtime"
+        srt_bwrap = (runtime_root / "pressure-vessel" / "libexec"
+                     / "steam-runtime-tools-0" / "srt-bwrap")
+        srt_bwrap.parent.mkdir(parents=True)
+        srt_bwrap.write_text("#!/bin/sh\n", encoding="utf-8")
+        command = [
+            "/bin/true", str(runtime_root / "_v2-entry-point"),
+            "--", "proton", "runinprefix", "tool.exe",
+        ]
+        logs: list[str] = []
+        with patch("Utils.vfs.overlay._inside_flatpak", return_value=False):
+            wrapped = _bound_shadow_steam_runtime_command(
+                command, game_root, view, {"X": "1"}, bind_root,
+                mask_rels=[Path("Data/Masked")], log_fn=logs.append)
+        assert wrapped is not None
+        # The short-path bind exposes the same tree at a second root: the
+        # masks must cover BOTH spellings or the tool still sees the path.
+        game_pair = ["--tmpfs", str(game_root / "Data/Masked")]
+        bind_pair = ["--tmpfs", str(bind_root / "Data/Masked")]
+        game_index = _pair_index(wrapped, game_pair)
+        bind_index = _pair_index(wrapped, bind_pair)
+        assert game_index > 0 and bind_index > 0, wrapped
+        # After the view binds, before the inner command separator.
+        assert wrapped.index("--bind") < game_index, wrapped
+        assert game_index < wrapped.index("--chdir"), wrapped
+        assert bind_index < wrapped.index("--chdir"), wrapped
+
+        # A mask target absent from the view is dropped, never created.
+        with patch("Utils.vfs.overlay._inside_flatpak", return_value=False):
+            unmasked = _bound_shadow_steam_runtime_command(
+                command, game_root, view, None, bind_root,
+                mask_rels=[Path("Data/Absent")], log_fn=logs.append)
+        assert unmasked is not None
+        assert not any("--tmpfs" == token for token in unmasked), unmasked
+        assert any("Data/Absent" in line and "skipped" in line.lower()
+                   for line in logs), logs
+
+        # Without a short-path bind only the game-root spelling is masked.
+        with patch("Utils.vfs.overlay._inside_flatpak", return_value=False):
+            same_root = _bound_shadow_steam_runtime_command(
+                command, game_root, view, None, game_root,
+                mask_rels=[Path("Data/Masked")], log_fn=logs.append)
+        assert same_root is not None
+        assert _pair_index(same_root, game_pair) > 0, same_root
+        assert _pair_index(same_root, bind_pair) == -1, same_root
+    print("✓ srt-bwrap masks both bind roots and skips absent targets")
+
+
+def test_reject_masks_when_direct_routes() -> None:
+    """Routes without a mount namespace reject every requested mask, loudly."""
+    from Utils.vfs.overlay import _reject_masks_when
+
+    _reject_masks_when([], backend=BACKEND_SHADOW, route="direct shadow UMU")
+    for route in ("direct shadow UMU", "direct shadow Steam Runtime",
+                  "direct shadow opt-in", "fuse-overlayfs"):
+        try:
+            _reject_masks_when([Path("Data/Masked")],
+                               backend=BACKEND_SHADOW, route=route)
+        except RuntimeError as exc:
+            assert route in str(exc), str(exc)
+            assert "Data/Masked" in str(exc), str(exc)
+        else:
+            raise AssertionError(f"route {route!r} dropped the masks")
+    print("✓ namespace-less launch routes reject masks instead of dropping them")
+
+
+def test_wrap_tool_command_masks_fail_loud_without_vfs() -> None:
+    """B1: masks without a game/VFS manifest raise; masks are never dropped."""
+    from Utils.executables.launch import wrap_tool_command
+
+    quiet = lambda _m: None
+    original = ["/bin/true"]
+    try:
+        wrap_tool_command(None, original, {}, log_fn=quiet,
+                          mask_paths=["Data/Hidden"])
+    except RuntimeError as exc:
+        assert "mask" in str(exc).lower(), str(exc)
+        assert "Data/Hidden" in str(exc), str(exc)
+    else:
+        raise AssertionError("masks were silently dropped without a game")
+    assert wrap_tool_command(None, original, {}, log_fn=quiet) == original
+
+    with tempfile.TemporaryDirectory() as tmp:
+        game = _FakeGame(Path(tmp))
+        try:
+            wrap_tool_command(game, original, {}, log_fn=quiet,
+                              mask_paths=["Data/Hidden"])
+        except RuntimeError as exc:
+            assert "manifest" in str(exc).lower(), str(exc)
+            assert "Data/Hidden" in str(exc), str(exc)
+        else:
+            raise AssertionError(
+                "masks were silently dropped without a VFS manifest")
+        # Empty masks stay a plain pass-through.
+        assert wrap_tool_command(game, original, {}, log_fn=quiet) == original
+
+        # With a manifest the masks thread into the wrapped command.
+        state = _write_manifest(game)
+        manifest_path = state / MANIFEST_NAME
+        manifest = json.loads(manifest_path.read_text())
+        view = state / "view"
+        (view / "Data" / "Hidden").mkdir(parents=True)
+        (view / "Data" / "Hidden" / "old.dds").write_text("old")
+        manifest["backend"] = BACKEND_SHADOW
+        manifest["view_root"] = str(view)
+        manifest_path.write_text(json.dumps(manifest))
+        with patch("Utils.vfs.overlay._inside_flatpak", return_value=False), \
+                patch("Utils.vfs.overlay._bubblewrap_binary",
+                      return_value="bwrap"), \
+                patch("Utils.vfs.overlay._bubblewrap_status",
+                      return_value=(True, "")):
+            wrapped = wrap_tool_command(
+                game, original, {}, log_fn=quiet,
+                mask_paths=["Data/Hidden"])
+        mask_pair = ["--tmpfs", str(game.game / "Data/Hidden")]
+        assert any(wrapped[i:i + 2] == mask_pair
+                   for i in range(len(wrapped) - 1)), wrapped
+    print("✓ wrap_tool_command fails loud when masks cannot be applied")
+
+
+def test_launch_mask_threading() -> None:
+    """run_tool_logged forwards mask_paths on both launch routes."""
+    from contextlib import nullcontext
+    from unittest import mock
+    from Utils.executables import launch
+
+    recorded: dict = {}
+
+    def _record_wrap(game, command, env, log_fn=None, label=None,
+                     mask_paths=()):
+        recorded["mask_paths"] = list(mask_paths)
+        return command
+
+    class _FakeProc:
+        stdout = iter(())
+
+        def wait(self):
+            return 0
+
+    with mock.patch("Utils.executables.launch.wrap_tool_command",
+                    side_effect=_record_wrap), \
+            mock.patch("Utils.launchers.steam.proton_run_command",
+                       return_value=["/bin/sh", "-c", "exit 0"]), \
+            mock.patch("Utils.executables.launch.subprocess.Popen",
+                       return_value=_FakeProc()), \
+            mock.patch("Utils.executables.launch._register_live_tool",
+                       return_value=1), \
+            mock.patch("Utils.executables.launch._forget_live_tool"), \
+            mock.patch("Utils.executables.launch.inhibit_sleep",
+                       side_effect=lambda *a, **k: nullcontext()):
+        rc = launch.run_tool_logged(
+            Path("/fake/proton"), Path("/fake/tool.exe"), {},
+            log_fn=lambda _m: None,
+            game=object(), owner=None, mask_paths=["Data/Hidden"])
+    assert rc == 0
+    assert recorded["mask_paths"] == ["Data/Hidden"], recorded
+
+    # The winetricks-style route forwards them too.
+    with mock.patch.object(launch, "run_tool_winetricks_style",
+                           return_value=7) as winetricks:
+        rc = launch.run_tool_logged(
+            Path("/fake/proton"), Path("/fake/tool.exe"),
+            {"AMM_WINETRICKS_STYLE": "1", "STEAM_COMPAT_DATA_PATH": "/pfx"},
+            log_fn=lambda _m: None, game=None, mask_paths=["Data/Hidden"])
+    assert rc == 7
+    assert winetricks.call_args.kwargs["mask_paths"] == ["Data/Hidden"], \
+        winetricks.call_args
+    print("✓ run_tool_logged threads mask_paths through both launch routes")
+
+
+def test_mask_case_variant_canonicalization() -> None:
+    """A mask spelled differently from the stored entry re-points at the real
+    entry (Wine lookups are case-insensitive while the tree keeps the filemap
+    spelling): mounting at the requested spelling would create that spelling
+    beside the real entry and hide nothing."""
+    with tempfile.TemporaryDirectory() as tmp:
+        game = _FakeGame(Path(tmp))
+        state = _write_manifest(game)
+        manifest_path = state / MANIFEST_NAME
+        manifest = json.loads(manifest_path.read_text())
+        view = state / "view"
+        (view / "Data" / "Masked").mkdir(parents=True)
+        (view / "Data" / "Masked" / "old.dds").write_text("old")
+        manifest["backend"] = BACKEND_SHADOW
+        manifest["view_root"] = str(view)
+        manifest_path.write_text(json.dumps(manifest))
+        original = ["/bin/true"]
+        quiet = lambda _m: None
+        with patch("Utils.vfs.overlay._inside_flatpak", return_value=False), \
+                patch("Utils.vfs.overlay._bubblewrap_binary",
+                      return_value="bwrap"), \
+                patch("Utils.vfs.overlay._bubblewrap_status",
+                      return_value=(True, "")):
+            wrapped = wrap_command(
+                game, original, log_fn=quiet,
+                mask_paths=["data/MASKED"])
+        pair = ["--tmpfs", str(game.game / "Data" / "Masked")]
+        assert any(wrapped[i:i + 2] == pair
+                   for i in range(len(wrapped) - 1)), wrapped
+        # The requested spelling must NOT be mounted: it would create a stray
+        # lowercase entry in the view and hide nothing.
+        assert str(game.game / "data/MASKED") not in wrapped, wrapped
+
+        # The kernel-overlayfs route canonicalizes layer-only content too
+        # (the data-layer spelling wins in the merge, prefix re-attached).
+        manifest["backend"] = BACKEND_KERNEL
+        manifest_path.write_text(json.dumps(manifest))
+        (state / "lower" / "data" / "Layered").mkdir(parents=True)
+        (state / "lower" / "data" / "Layered" / "l.dds").write_text("layer")
+        with patch("Utils.vfs.overlay._bubblewrap_binary",
+                   return_value="bwrap"), \
+                patch("Utils.vfs.overlay.bubblewrap_status",
+                      return_value=(True, "")):
+            kernel_wrapped = wrap_command(
+                game, original, log_fn=quiet,
+                mask_paths=["data/layered"])
+        pair = ["--tmpfs", str(game.game / "Data" / "Layered")]
+        assert any(kernel_wrapped[i:i + 2] == pair
+                   for i in range(len(kernel_wrapped) - 1)), kernel_wrapped
+        assert str(game.game / "data/layered") not in kernel_wrapped, \
+            kernel_wrapped
+
+        # Case TWINS ('Data/Masked' AND 'data/masked' exist) are BOTH visible
+        # in the merge: the mask must cover every spelling - mounting only one
+        # would create it beside the other and hide nothing there.
+        (view / "data" / "masked").mkdir(parents=True)
+        (view / "data" / "masked" / "b.txt").write_text("b")
+        manifest["backend"] = BACKEND_SHADOW
+        manifest_path.write_text(json.dumps(manifest))
+        logs: list[str] = []
+        with patch("Utils.vfs.overlay._inside_flatpak", return_value=False), \
+                patch("Utils.vfs.overlay._bubblewrap_binary",
+                      return_value="bwrap"), \
+                patch("Utils.vfs.overlay._bubblewrap_status",
+                      return_value=(True, "")):
+            twin_wrapped = wrap_command(
+                game, original, log_fn=logs.append,
+                mask_paths=["Data/MASKED"])
+        for twin_pair in (["--tmpfs", str(game.game / "Data/Masked")],
+                          ["--tmpfs", str(game.game / "data/masked")]):
+            assert any(twin_wrapped[i:i + 2] == twin_pair
+                       for i in range(len(twin_wrapped) - 1)), twin_wrapped
+        assert any("several case spellings" in line for line in logs), logs
+        # End-to-end: both twins are hidden for the launched process only.
+        script = (
+            f'test -z "$(ls -A {game.game / "Data" / "Masked"})" && '
+            f'test -z "$(ls -A {game.game / "data" / "masked"})"'
+        )
+        result = subprocess.run(
+            wrap_command(game, ["/bin/sh", "-c", script], log_fn=quiet,
+                         mask_paths=["Data/MASKED"]),
+            text=True, capture_output=True, check=False)
+        assert result.returncode == 0, result.stderr
+        # ...and both twins still exist outside the namespace.
+        assert (view / "Data" / "Masked" / "old.dds").read_text() == "old"
+        assert (view / "data" / "masked" / "b.txt").read_text() == "b"
+    print("✓ case-variant masks re-point at the real entry, never create one")
+
+
 def test_appimage_bubblewrap_fallback() -> None:
     from Utils.vfs.overlay import _bubblewrap_binary
 
@@ -5359,6 +5800,20 @@ def test_flatpak_handoff_permission_is_deploy_managed() -> None:
 def main() -> None:
     if not shutil.which("bwrap"):
         raise SystemExit("SKIP: bubblewrap is not installed")
+    selected = sys.argv[1:]
+    if selected:
+        # Explicit selection (used by CI): run only the named checks. The full
+        # suite needs native/runtime deps that may be absent (lz4, the
+        # filegraph native bits) and some checks assume /bin/true (missing on
+        # NixOS) - pre-existing failures unrelated to the selected checks.
+        scope = globals()
+        for name in selected:
+            fn = scope.get(name)
+            if not callable(fn) or not name.startswith("test_"):
+                raise SystemExit(f"unknown self-test: {name}")
+            fn()
+        print(f"{len(selected)} selected profile VFS self-tests passed.")
+        return
     test_nested_overlay()
     test_fuse_overlay()
     test_layer_build_and_skse_selection()
@@ -5404,6 +5859,12 @@ def main() -> None:
     test_vfs_as_deploy_method()
     test_deploy_pipeline_stops_on_incomplete_restore()
     test_flatpak_host_wrap()
+    test_wrap_command_mask_paths()
+    test_mask_case_variant_canonicalization()
+    test_srt_bwrap_mask_insertion()
+    test_reject_masks_when_direct_routes()
+    test_wrap_tool_command_masks_fail_loud_without_vfs()
+    test_launch_mask_threading()
     test_appimage_bubblewrap_fallback()
     test_watched_game_launch_uses_safe_standard_handles()
     test_umu_uses_shadow_directly()

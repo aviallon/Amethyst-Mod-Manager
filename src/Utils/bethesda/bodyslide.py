@@ -69,17 +69,19 @@ def sanitize_output_name(raw: str, default: str) -> str:
 
 def ensure_output_mod(game: "BaseGame", profile: str, mod_name: str) -> Path:
     """Create the empty output-capture mod folder and enable it in the
-    profile's modlist (prepended) when missing."""
+    profile's modlist (prepended) when missing. The modlist file is CREATED
+    when the profile has none yet: an unregistered output mod would never
+    deploy, and "enable the mod" is not an instruction the user can act on
+    without an entry."""
     staging = game.get_effective_mod_staging_path()
     mod_dir = staging / mod_name
     mod_dir.mkdir(parents=True, exist_ok=True)
 
     modlist_path = game.get_profile_root() / "profiles" / profile / "modlist.txt"
-    if modlist_path.is_file():
-        from Utils.mods.modlist import prepend_mod, read_modlist
-        entries = read_modlist(modlist_path)
-        if not any(e.name == mod_name for e in entries):
-            prepend_mod(modlist_path, mod_name, enabled=True)
+    from Utils.mods.modlist import prepend_mod, read_modlist
+    entries = read_modlist(modlist_path)
+    if not any(e.name == mod_name for e in entries):
+        prepend_mod(modlist_path, mod_name, enabled=True)
 
     return mod_dir
 

@@ -24,6 +24,7 @@ from Utils.filegraph.models import (
     ResolutionDelta, SnapshotExport, Winner,
 )
 from Utils.filegraph.native import pack, require_native, unpack
+from Utils.mods.names import staging_mod_dirs
 
 
 def _native_error(exc: BaseException) -> BaseException:
@@ -1273,8 +1274,7 @@ class LibrarySession:
             names = {name.lower(): name for name in fingerprints}
             previous = {name.lower(): value for name, value in fingerprints.items()}
             variants = self.variant_keys()
-            roots = {entry.name: entry for entry in adapter.staging.iterdir()
-                     if entry.is_dir() and not entry.name.endswith("_separator")}
+            roots = {entry.name: entry for entry in staging_mod_dirs(adapter.staging)}
             roots[OVERWRITE_NAME] = adapter.overwrite
             roots[ROOT_FOLDER_NAME] = adapter.root_folder
             changed, shared_changed = [], False

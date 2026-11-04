@@ -13,14 +13,17 @@ from __future__ import annotations
 import threading
 from typing import TYPE_CHECKING
 
-from PySide6.QtCore import Qt, QT_TRANSLATE_NOOP, QTimer, Signal
+from PySide6.QtCore import Qt, QT_TRANSLATE_NOOP, Signal
 from PySide6.QtWidgets import (
-    QApplication, QButtonGroup, QCheckBox, QHBoxLayout, QLabel, QRadioButton,
+    QButtonGroup, QCheckBox, QHBoxLayout, QLabel, QRadioButton,
     QVBoxLayout, QWidget,
 )
 
 from gui_qt.safe_emit import safe_emit
 from gui_qt.theme_qt import active_palette, _c
+# Shared with the TexGen/DynDOLOD wizard: the tool-lock release helper lives
+# in wizards_qt so every wizard's worker releases the deploy lock the same way.
+from wizards_qt import release_on_main as _release_on_main
 from wizards_qt._view_base import GREEN, RED, WizardViewBase
 from Utils.wizards.textures import (
     VRAMR_PRESETS, TextureToolCancelled, texture_tool_installed,
@@ -74,22 +77,6 @@ def _discard_output(output_dir, name: str, log_fn) -> None:
             log_fn(f"{name}: discarded partial output at {output_dir}")
     except Exception as exc:
         log_fn(f"{name}: could not remove partial output: {exc}")
-
-
-def _release_on_main(set_lock) -> None:
-    """Call ``set_lock(False)`` on the GUI thread from a worker thread.
-
-    Falls back to a direct call if there is no QApplication to hop through -
-    leaving the lock held would be far worse than a cross-thread release of
-    what is only a dict write plus a setEnabled."""
-    try:
-        app = QApplication.instance()
-        if app is not None:
-            QTimer.singleShot(0, app, lambda: set_lock(False))
-            return
-    except Exception:
-        pass
-    set_lock(False)
 
 
 class TextureToolView(WizardViewBase):

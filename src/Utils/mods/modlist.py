@@ -21,6 +21,7 @@ from pathlib import Path
 
 from Utils.app_log import app_log
 from Utils.atomic_write import write_atomic_text
+from Utils.mods.names import RESERVED_STAGING_NAMES
 
 _SEPARATOR_SUFFIX = "_separator"
 
@@ -155,6 +156,57 @@ def write_modlist(modlist_path: Path, entries: list[ModEntry]) -> None:
                       errors="surrogateescape")
 
 
+def _warn_unmodelled_lines(modlist_path: Path) -> None:
+    """Warn when a rewrite would drop lines read_modlist does not model.
+
+    read_modlist/write_modlist model prefix (+/-/*) lines only: blank and
+    comment lines are silently lost on any rewrite. Warn instead of losing
+    them in silence.
+    """
+    try:
+        raw_lines = modlist_path.read_text(
+            encoding="utf-8", errors="surrogateescape").splitlines()
+    except OSError:
+        return
+    unmodelled = [ln for ln in raw_lines
+                  if not ln.strip() or ln[0] not in ("+", "-", "*")]
+    if unmodelled:
+        app_log(f"Modlist: rewriting {modlist_path.name!r} drops "
+                f"{len(unmodelled)} unmodelled line(s) (blank/comment "
+                f"lines are not preserved): {unmodelled[:3]!r}")
+
+
+def set_mod_enabled(modlist_path: Path, mod_name: str, enabled: bool) -> bool:
+    """Set one entry's enabled flag in place (position preserved) and report
+    whether the flag is ACTUALLY in the requested state afterwards.
+
+    True means the mod is in the requested state now - this call set it or it
+    already was. False means the requested state is NOT in effect and cannot
+    be assumed: no matching entry exists, the entry is a separator, or the
+    entry is locked (``*``) and its forced state differs from the request (a
+    locked mod can never be deactivated). Callers enforcing a state - e.g. a
+    wizard hiding its output mod from one deploy - MUST treat False as "not
+    enforced" and fail loud instead of trusting the request.
+
+    Locked entries are never modified; the modlist is rewritten only when a
+    flag actually changed.
+    """
+    with modlist_lock(modlist_path):
+        entries = read_modlist(modlist_path)
+        matched = [entry for entry in entries
+                   if entry.name == mod_name and not entry.is_separator]
+        changed = False
+        for entry in matched:
+            if not entry.locked and entry.enabled != enabled:
+                entry.enabled = enabled
+                changed = True
+        if changed:
+            _warn_unmodelled_lines(modlist_path)
+            write_modlist(modlist_path, entries)
+        return bool(matched) and all(entry.enabled == enabled
+                                     for entry in matched)
+
+
 def prepend_mod(modlist_path: Path, mod_name: str, enabled: bool = True,
                 preserve_existing_state: bool = False) -> None:
     """
@@ -177,6 +229,7 @@ def prepend_mod(modlist_path: Path, mod_name: str, enabled: bool = True,
         else:
             new_entry = ModEntry(name=mod_name, enabled=enabled, locked=False)
         entries.insert(0, new_entry)
+        _warn_unmodelled_lines(modlist_path)
         write_modlist(modlist_path, entries)
 
 
@@ -293,14 +346,10 @@ def move_mods_to_anchor(
         return True
 
 
-# Profile-root infrastructure folder names. If one of these turns up *inside*
-# the mods/ staging folder it's almost always stray/test pollution (a mirror of
-# the profile-root layout), never a real mod - so the sync must never adopt it
-# into modlist.txt. Case-insensitive match.
-_RESERVED_STAGING_NAMES = frozenset({
-    "mods", "overwrite", "profiles", "backups",
-    "root_folder", "applications",
-})
+# Reserved infrastructure/scratch names (see Utils.mods.names, which also
+# filters the filegraph staging scans): the sync must never adopt them into
+# modlist.txt.
+_RESERVED_STAGING_NAMES = RESERVED_STAGING_NAMES
 
 
 def _migrate_profile_renames(profile_dir: Path,
@@ -369,7 +418,8 @@ def sync_modlist_with_mods_folder(
     if sanitize_mod_folder_name is not None:
         try:
             for d in list(mods_dir.iterdir()):
-                if not d.is_dir() or d.name.endswith("_separator"):
+                if (not d.is_dir() or d.name.endswith("_separator")
+                        or d.name.lower() in _RESERVED_STAGING_NAMES):
                     continue
                 clean = sanitize_mod_folder_name(d.name)
                 # No change, or the sanitizer bailed to its placeholder fallback

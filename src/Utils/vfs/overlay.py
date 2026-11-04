@@ -28,7 +28,7 @@ import shutil
 import subprocess
 import threading
 from pathlib import Path, PureWindowsPath
-from typing import Iterable
+from typing import Iterable, Sequence
 
 from Utils.diagnostics import performance as perftrace
 from Utils.atomic_write import write_atomic_text
@@ -2167,7 +2167,8 @@ def _direct_shadow_steam_runtime_command(
 
 def _bound_shadow_steam_runtime_command(
         command: list[str], game_root: Path, view: Path,
-        env: dict[str, str] | None, bind_root: Path) -> list[str] | None:
+        env: dict[str, str] | None, bind_root: Path,
+        mask_rels: Sequence[Path] = (), log_fn=None) -> list[str] | None:
     """Bind the view at the short game path *inside* pressure-vessel.
 
     Skyrim needs its configured install path to remain visible because deeply
@@ -2221,6 +2222,17 @@ def _bound_shadow_steam_runtime_command(
     ]
     if bind_root != game_root:
         inner_bind.extend(["--bind", str(view), str(bind_root)])
+    # Mask mounts cover the bound view content and must stay before the
+    # command separator. A short-path bind exposes the same tree at a second
+    # root, so mask both spellings or the tool would still see the paths.
+    # Targets are canonicalized first (the real spelling the tool would see)
+    # and absent ones dropped: --tmpfs would create them in the view.
+    mask_rels = _resolve_mask_targets(
+        mask_rels, lambda rel: ((view, rel, None),),
+        log_fn or (lambda _m: None))
+    inner_bind.extend(_mask_mount_args(game_root, mask_rels))
+    if bind_root != game_root:
+        inner_bind.extend(_mask_mount_args(bind_root, mask_rels))
     inner_bind.extend(["--chdir", str(bind_root), "--"])
     direct = [
         *bound_command[:separator_index + 1],
@@ -2275,9 +2287,163 @@ def _direct_shadow_opt_in_command(command: list[str], game_root: Path,
     return [*wrapper, *host_command]
 
 
+def _mask_relative_paths(game_root: Path,
+                         mask_paths: Sequence[Path | str],
+                         ) -> list[Path]:
+    """Normalize requested launch masks to game-root-relative paths.
+
+    A mask hides one path inside the launched process' mount namespace only;
+    nothing is written to the deployment or staging trees on disk. Absolute
+    spellings are accepted when they sit below the game root (the tree the
+    tool scans) and are reduced to their relative form; anything else cannot
+    name a path inside the bound view and is rejected loudly instead of being
+    silently dropped. Order is preserved and duplicates collapse. Masks are
+    then canonicalized to the spelling the tool would actually see (and
+    absent ones dropped) by :func:`_resolve_mask_targets`.
+    """
+    resolved_root = game_root.resolve(strict=False)
+    rels: list[Path] = []
+    for raw in mask_paths:
+        candidate = Path(str(raw).replace("\\", "/"))
+        if candidate.is_absolute():
+            try:
+                rel = candidate.resolve(strict=False).relative_to(resolved_root)
+            except (OSError, ValueError) as exc:
+                raise RuntimeError(
+                    f"Profile VFS mask is outside the game root: {raw}"
+                ) from exc
+        else:
+            rel = candidate
+        if rel == Path(".") or not rel.parts or ".." in rel.parts:
+            raise RuntimeError(
+                "Profile VFS masks must be non-empty paths below the game "
+                f"root: {raw!r}"
+            )
+        if rel not in rels:
+            rels.append(rel)
+    return rels
+
+
+def _resolve_mask_targets(rels: Sequence[Path], candidates_for,
+                          log_fn) -> list[Path]:
+    """Canonicalize each mask to EVERY spelling the tool could actually see
+    and drop masks whose target exists in none of the candidate trees.
+
+    ``--tmpfs <dest>`` creates a missing destination inside the namespace
+    (against the bound view or the overlay upper), so two silent failure
+    modes must never happen: masking a path that is not there would MUTATE
+    the very view this wrapper promises not to touch (skipped with a log line
+    instead), and masking a case-variant spelling would create that spelling
+    beside the real entry and hide nothing. A tree can even hold case TWINS
+    ("Masked" and "masked", both visible in the merge), so every existing
+    spelling gets its own mount (case twins are logged; a request that
+    duplicates an earlier mask is logged and collapsed). ``candidates_for(rel)``
+    yields ``(root, sub, prefix)`` triples: *sub* is looked up under *root*
+    and the resulting game-root spelling is ``prefix / <found spelling>``
+    (``prefix=None`` for root-keyed trees). Only used on launch routes that
+    CAN mask; routes without a mount namespace reject every requested mask
+    loudly first.
+    """
+    resolved: list[Path] = []
+    for rel in rels:
+        hits: list[Path] = []
+        for root, sub, prefix in candidates_for(rel):
+            for spelling in _mask_targets_visible(root, sub):
+                hit = spelling if prefix is None else prefix / spelling
+                if hit not in hits:
+                    hits.append(hit)
+        if not hits:
+            log_fn(f"VFS mask skipped: '{rel}' is absent from the game view "
+                   "- nothing to hide (a mask never creates its target).")
+            continue
+        if len(hits) > 1:
+            log_fn(f"VFS mask note: '{rel}' matches several case spellings - "
+                   "masking every one of: "
+                   + ", ".join(str(hit) for hit in hits))
+        for hit in hits:
+            if hit in resolved:
+                log_fn(f"VFS mask: '{rel}' maps to '{hit}', already masked - "
+                       "collapsed.")
+            else:
+                resolved.append(hit)
+    return resolved
+
+
+def _mask_targets_visible(root: Path, rel: Path) -> list[Path]:
+    """Every spelling of *rel* the tool could see under *root*.
+
+    Exact spelling first; then a case-insensitive walk gathers EVERY match:
+    Wine lookups are case-insensitive while trees keep the filemap spelling,
+    and a directory can legitimately hold case twins - both are visible in
+    the merge, so a mask must cover all of them (mounting at one spelling
+    would create it beside the others and hide nothing).
+    """
+    found: list[Path] = []
+    if os.path.lexists(root / rel):
+        found.append(rel)
+    frontier: list[tuple[Path, list[str]]] = [(root, [])]
+    for part in rel.parts:
+        next_frontier: list[tuple[Path, list[str]]] = []
+        for current, acc in frontier:
+            if not current.is_dir():
+                continue
+            try:
+                entries = list(current.iterdir())
+            except OSError:
+                continue
+            for entry in entries:
+                if entry.name.lower() == part.lower():
+                    next_frontier.append((entry, acc + [entry.name]))
+        frontier = next_frontier
+    for _entry, names in frontier:
+        spelling = Path(*names)
+        if spelling not in found:
+            found.append(spelling)
+    return found
+
+
+def _mask_mount_args(game_root: Path, rels: Sequence[Path]) -> list[str]:
+    """bwrap arguments that empty each masked path inside the namespace.
+
+    ``--tmpfs <dest>`` hides whatever the destination holds (verified with
+    bubblewrap 0.11.2: a preceding ``--dir`` is NOT needed, and mounting a
+    tmpfs over a regular file fails loudly). The mounts must be emitted after
+    the view/overlay mounts (so they cover the deployed content) and before
+    the ``--`` separator (so they stay wrapper arguments). An empty list adds
+    no arguments at all. Callers must canonicalize/pre-filter targets through
+    :func:`_resolve_mask_targets`: ``--tmpfs`` creates a missing destination
+    and would mount a case-variant spelling beside the real entry - a mask
+    must never do either.
+    """
+    args: list[str] = []
+    for rel in rels:
+        args += ["--tmpfs", str(game_root / rel)]
+    return args
+
+
+def _reject_masks_when(mask_rels: Sequence[Path], *, backend: str,
+                       route: str) -> None:
+    """Fail loud when masks are requested on a route that cannot honour them."""
+    if not mask_rels:
+        return
+    raise RuntimeError(
+        f"Profile VFS backend {backend!r} launch route {route!r} cannot hide "
+        "masked paths (it creates no mount namespace): "
+        + ", ".join(str(rel) for rel in mask_rels)
+        + ". Use a bubblewrap-backed launch route or drop the masks."
+    )
+
+
 def wrap_command(game, command: list[str], env: dict[str, str] | None = None,
-                 log_fn=None) -> list[str]:
-    """Wrap *command* in the deployed profile's private game view."""
+                 log_fn=None, mask_paths: Sequence[Path | str] = ()) -> list[str]:
+    """Wrap *command* in the deployed profile's private game view.
+
+    *mask_paths* (game-root-relative, or absolute below the game root) hides
+    those paths for the launched process only, via empty tmpfs mounts inside
+    its mount namespace. Masks are additive; passing none keeps the generated
+    command byte-identical to an unmasked launch. A backend or launch route
+    without a mount namespace raises instead of dropping the masks.
+    """
     if not command:
         raise RuntimeError("No launch command was supplied to the profile VFS.")
 
@@ -2309,6 +2475,7 @@ def wrap_command(game, command: list[str], env: dict[str, str] | None = None,
         (view, view_data, _data_rel, game_root, data_root,
          _root_upper, _data_upper) = _validated_shadow_paths(
             game, payload, state)
+        mask_rels = _mask_relative_paths(game_root, mask_paths)
         for label, path in (
             ("game root", game_root),
             ("shadow root", view),
@@ -2346,17 +2513,24 @@ def wrap_command(game, command: list[str], env: dict[str, str] | None = None,
             )
         if bind_at_game_root and bind_is_safe:
             bound_runtime = _bound_shadow_steam_runtime_command(
-                command, game_root, view, env, bind_root)
+                command, game_root, view, env, bind_root,
+                mask_rels=mask_rels, log_fn=log_fn)
             if bound_runtime is not None:
                 return routed("shadow Steam Runtime bind", bound_runtime)
         if not bind_at_game_root or not bind_is_safe:
             direct_umu = _direct_shadow_umu_command(
                 command, game_root, view, env)
             if direct_umu is not None:
+                _reject_masks_when(
+                    mask_rels, backend=BACKEND_SHADOW,
+                    route="direct shadow UMU")
                 return routed("direct shadow UMU", direct_umu)
             direct_runtime = _direct_shadow_steam_runtime_command(
                 command, game_root, view, env)
             if direct_runtime is not None:
+                _reject_masks_when(
+                    mask_rels, backend=BACKEND_SHADOW,
+                    route="direct shadow Steam Runtime")
                 return routed("direct shadow Steam Runtime", direct_runtime)
         if ((not bind_at_game_root
                 and getattr(game, "vfs_direct_shadow_launch", False))
@@ -2369,6 +2543,10 @@ def wrap_command(game, command: list[str], env: dict[str, str] | None = None,
                     "game's profile/staging directory onto the game "
                     "filesystem, then redeploy."
                 )
+            _reject_masks_when(
+                mask_rels, backend=BACKEND_SHADOW,
+                route=("direct shadow cross-filesystem fallback"
+                       if not bind_is_safe else "direct shadow opt-in"))
             return routed(
                 ("direct shadow cross-filesystem fallback"
                  if not bind_is_safe else "direct shadow opt-in"),
@@ -2383,6 +2561,8 @@ def wrap_command(game, command: list[str], env: dict[str, str] | None = None,
             "--die-with-parent",
             "--dev-bind", "/", "/",
             "--bind", str(view), str(game_root),
+            *_mask_mount_args(game_root, _resolve_mask_targets(
+                mask_rels, lambda rel: ((view, rel, None),), log_fn)),
             "--",
             *host_command,
         ], helpers=True)
@@ -2405,7 +2585,10 @@ def wrap_command(game, command: list[str], env: dict[str, str] | None = None,
     if paths["data_upper"].stat().st_dev != paths["data_work"].stat().st_dev:
         raise RuntimeError("Profile VFS data upper/work directories are on different filesystems.")
 
+    mask_rels = _mask_relative_paths(paths["game_root"], mask_paths)
     if backend == BACKEND_FUSE:
+        _reject_masks_when(
+            mask_rels, backend=BACKEND_FUSE, route="fuse-overlayfs")
         ok, reason = fuse_overlay_status()
         if not ok:
             raise RuntimeError(
@@ -2433,6 +2616,32 @@ def wrap_command(game, command: list[str], env: dict[str, str] | None = None,
         raise RuntimeError(
             f"Profile VFS manifest selects an unknown backend: {backend!r}."
         )
+    # What the tool would see at game_root/<rel> is the overlay merge: the
+    # game root, the captured layers and the write upper. A mask must hide
+    # content wherever it comes from - but only hide, never create.
+    try:
+        data_rel: Path | None = paths["data_root"].relative_to(
+            paths["game_root"])
+    except ValueError:
+        data_rel = None
+
+    def _merged_candidates(rel: Path):
+        candidates = [(paths["game_root"], rel, None),
+                      (paths["root_layer"], rel, None),
+                      (paths["root_upper"], rel, None)]
+        if data_rel is not None:
+            # Case-insensitive prefix match: the request spelling may differ
+            # from the data_root spelling (Wine lookups are case-insensitive).
+            rel_parts, prefix_parts = rel.parts, data_rel.parts
+            if (len(rel_parts) > len(prefix_parts)
+                    and [p.lower() for p in rel_parts[:len(prefix_parts)]]
+                    == [p.lower() for p in prefix_parts]):
+                sub = Path(*rel_parts[len(prefix_parts):])
+                candidates += [(paths["data_layer"], sub, data_rel),
+                               (paths["data_upper"], sub, data_rel)]
+        return candidates
+
+    mask_rels = _resolve_mask_targets(mask_rels, _merged_candidates, log_fn)
     ok, reason = bubblewrap_status()
     if not ok:
         raise RuntimeError(
@@ -2453,6 +2662,7 @@ def wrap_command(game, command: list[str], env: dict[str, str] | None = None,
         "--overlay-src", str(paths["data_layer"]),
         "--overlay", str(paths["data_upper"]), str(paths["data_work"]),
         str(paths["data_root"]),
+        *_mask_mount_args(paths["game_root"], mask_rels),
         "--",
         *host_command,
     ], helpers=True)
