@@ -1,5 +1,6 @@
 """Focused regression tests for the xEdit QAC output redirect, fixed-point
-cleaning loop, and the Filegraph staging-dirty marker.
+cleaning loop, the Filegraph staging-dirty marker, and the wizard output-mod
+helpers (per-profile name, clean-build-dir swap, modlist toggling).
 
 Run from the repository root with::
 
@@ -9,6 +10,7 @@ Run from the repository root with::
 from __future__ import annotations
 
 import os
+import shutil
 import tempfile
 import unittest
 import zlib
@@ -600,6 +602,490 @@ class BodySlideChunkTests(unittest.TestCase):
 
     def test_process_tree_rss_mb_survives_a_missing_pid(self) -> None:
         self.assertEqual(process_tree_rss_mb(999_999_998), 0.0)
+
+
+class OutputModSwapTests(unittest.TestCase):
+    """swap_output_into_mod: atomic whole-directory replace of the mod content."""
+
+    @staticmethod
+    def _layout(root: Path) -> tuple[Path, Path]:
+        build = root / "staging" / "Mod.build"
+        mod = root / "staging" / "Mod"
+        build.mkdir(parents=True)
+        (build / "new1.txt").write_text("new1", encoding="utf-8")
+        (build / "new2.txt").write_text("new2", encoding="utf-8")
+        mod.mkdir(parents=True)
+        (mod / "old.txt").write_text("old", encoding="utf-8")
+        return build, mod
+
+    def test_swap_replaces_old_content_and_cleans_up(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            build, mod = self._layout(Path(temporary))
+            installed = xedit.swap_output_into_mod(build, mod)
+            self.assertEqual(installed, 2)
+            self.assertEqual(
+                {p.name for p in mod.iterdir()}, {"new1.txt", "new2.txt"})
+            self.assertEqual((mod / "new1.txt").read_text(encoding="utf-8"),
+                             "new1")
+            # The build dir is consumed by the rename swap: nothing is left
+            # for a modlist sync to adopt as a junk '<name>.build' entry.
+            self.assertFalse(build.exists())
+            self.assertFalse(
+                (build.parent / (build.name + ".previous")).exists())
+
+    def test_swap_refuses_an_empty_build_dir(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            build, mod = self._layout(Path(temporary))
+            for child in build.iterdir():
+                child.unlink()
+            with self.assertRaises(RuntimeError):
+                xedit.swap_output_into_mod(build, mod)
+            self.assertEqual((mod / "old.txt").read_text(encoding="utf-8"),
+                             "old")
+            self.assertTrue(build.is_dir())
+
+    def test_swap_refuses_a_missing_build_dir(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            build, mod = self._layout(Path(temporary))
+            shutil.rmtree(build)
+            with self.assertRaises(RuntimeError):
+                xedit.swap_output_into_mod(build, mod)
+            self.assertEqual((mod / "old.txt").read_text(encoding="utf-8"),
+                             "old")
+
+    def test_swap_rolls_back_when_the_final_rename_fails(self) -> None:
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as temporary:
+            build, mod = self._layout(Path(temporary))
+            real_replace = os.replace
+
+            def flaky_replace(src, dst, **kwargs):
+                if Path(src) == build:
+                    raise OSError("injected rename failure")
+                return real_replace(src, dst, **kwargs)
+
+            with mock.patch("Utils.bethesda.xedit.os.replace",
+                            side_effect=flaky_replace):
+                with self.assertRaises(RuntimeError):
+                    xedit.swap_output_into_mod(
+                        build, mod, log_fn=lambda _m: None)
+            # Rolled back with the single restore rename: the mod holds the
+            # old content again and the new output is untouched in the build
+            # dir - never a half-swapped mix.
+            self.assertEqual({p.name for p in mod.iterdir()}, {"old.txt"})
+            self.assertEqual((mod / "old.txt").read_text(encoding="utf-8"),
+                             "old")
+            self.assertEqual({p.name for p in build.iterdir()},
+                             {"new1.txt", "new2.txt"})
+            self.assertFalse(
+                (build.parent / (build.name + ".previous")).exists())
+
+    def test_swap_recovers_from_a_crash_between_the_renames(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            build, mod = self._layout(Path(temporary))
+            backup = build.parent / (build.name + ".previous")
+            # Simulate a crash between the two renames: the old content is
+            # parked in the backup (the ONLY complete copy), the mod dir is
+            # gone, the new output is still in the build dir.
+            mod.rename(backup)
+            logs: list[str] = []
+            installed = xedit.swap_output_into_mod(
+                build, mod, log_fn=logs.append)
+            self.assertEqual(installed, 2)
+            self.assertEqual({p.name for p in mod.iterdir()},
+                             {"new1.txt", "new2.txt"})
+            self.assertFalse(backup.exists())
+            self.assertFalse(build.exists())
+            # Discriminative: the backup was RESTORED first (and logged),
+            # never silently dropped.
+            self.assertTrue(any("restoring" in line for line in logs), logs)
+
+    def test_swap_recovers_the_previous_output_over_a_placeholder(self) -> None:
+        """ensure_output_mod recreates the mod dir as an EMPTY placeholder on
+        the next wizard run after a crashed swap. A placeholder is "no
+        previous content", never proof that the backup is stale - the
+        recovery must leave the PREVIOUS output installed (a real state
+        oracle, not just a log line)."""
+        with tempfile.TemporaryDirectory() as temporary:
+            build, mod = self._layout(Path(temporary))
+            backup = build.parent / (build.name + ".previous")
+            mod.rename(backup)
+            # Next wizard run: ensure_output_mod recreates an empty dir.
+            mod.mkdir()
+            logs: list[str] = []
+            xedit.recover_swap_leftovers(build, mod, log_fn=logs.append)
+            # STATE: the previous output is back in the mod dir now.
+            self.assertEqual({p.name for p in mod.iterdir()}, {"old.txt"})
+            self.assertEqual((mod / "old.txt").read_text(encoding="utf-8"),
+                             "old")
+            self.assertFalse(backup.exists())
+            self.assertTrue(any("restoring" in line for line in logs), logs)
+            # And the swap then installs the new output as usual.
+            installed = xedit.swap_output_into_mod(
+                build, mod, log_fn=logs.append)
+            self.assertEqual(installed, 2)
+            self.assertEqual({p.name for p in mod.iterdir()},
+                             {"new1.txt", "new2.txt"})
+            self.assertFalse(build.exists())
+
+    def test_swap_preserves_the_previous_output_when_the_install_fails(
+            self) -> None:
+        """C1 preservation property: in the placeholder case a FAILED install
+        must roll back to the PREVIOUS output (the backup), not to the empty
+        placeholder - the backup is the only complete copy of it."""
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as temporary:
+            build, mod = self._layout(Path(temporary))
+            backup = build.parent / (build.name + ".previous")
+            mod.rename(backup)
+            mod.mkdir()          # ensure_output_mod's empty placeholder
+            real_replace = os.replace
+
+            def flaky_replace(src, dst, **kwargs):
+                if Path(src) == build:
+                    raise OSError("injected rename failure")
+                return real_replace(src, dst, **kwargs)
+
+            with mock.patch("Utils.bethesda.xedit.os.replace",
+                            side_effect=flaky_replace):
+                with self.assertRaises(RuntimeError):
+                    xedit.swap_output_into_mod(
+                        build, mod, log_fn=lambda _m: None)
+            self.assertEqual({p.name for p in mod.iterdir()}, {"old.txt"})
+            self.assertEqual((mod / "old.txt").read_text(encoding="utf-8"),
+                             "old")
+            self.assertEqual({p.name for p in build.iterdir()},
+                             {"new1.txt", "new2.txt"})
+            self.assertFalse(backup.exists())
+
+    def test_swap_removes_a_stale_backup_when_the_mod_survived(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            build, mod = self._layout(Path(temporary))
+            backup = build.parent / (build.name + ".previous")
+            backup.mkdir()
+            (backup / "older.txt").write_text("older", encoding="utf-8")
+            # Touch the mod dir LAST so it is the later one (renames preserve
+            # mtimes: in a real completed swap the mod holds the newer build
+            # output).
+            os.utime(mod, None)
+            # Non-empty mod dir = the previous swap completed its install but
+            # crashed before cleanup: the mod is the later content and only
+            # then is the older backup removed (discriminative: logged).
+            logs: list[str] = []
+            installed = xedit.swap_output_into_mod(
+                build, mod, log_fn=logs.append)
+            self.assertEqual(installed, 2)
+            self.assertEqual({p.name for p in mod.iterdir()},
+                             {"new1.txt", "new2.txt"})
+            self.assertFalse(backup.exists())
+            self.assertTrue(any("stale swap backup" in line for line in logs),
+                            logs)
+
+    def test_swap_keeps_the_later_content_when_a_stale_backup_lingers(
+            self) -> None:
+        """Content is authority, not existence: with a NON-EMPTY mod dir the
+        backup is the OLDER output, so a failed install rolls back to the mod's
+        own later content."""
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as temporary:
+            build, mod = self._layout(Path(temporary))
+            backup = build.parent / (build.name + ".previous")
+            backup.mkdir()
+            (backup / "older.txt").write_text("older", encoding="utf-8")
+            (mod / "old.txt").write_text("later", encoding="utf-8")
+            os.utime(mod, None)      # the mod dir is the later one
+            real_replace = os.replace
+
+            def flaky_replace(src, dst, **kwargs):
+                if Path(src) == build:
+                    raise OSError("injected rename failure")
+                return real_replace(src, dst, **kwargs)
+
+            with mock.patch("Utils.bethesda.xedit.os.replace",
+                            side_effect=flaky_replace):
+                with self.assertRaises(RuntimeError):
+                    xedit.swap_output_into_mod(
+                        build, mod, log_fn=lambda _m: None)
+            self.assertEqual({p.name for p in mod.iterdir()}, {"old.txt"})
+            self.assertEqual((mod / "old.txt").read_text(encoding="utf-8"),
+                             "later")
+            self.assertFalse(backup.exists())
+            self.assertEqual({p.name for p in build.iterdir()},
+                             {"new1.txt", "new2.txt"})
+
+    def test_swap_refuses_to_drop_a_backup_newer_than_the_mod(self) -> None:
+        """Recency guard: a hand-edited (older) non-empty mod dir is not proof
+        of later content - when the backup is NEWER the call refuses loudly
+        instead of discarding either copy."""
+        import time
+        with tempfile.TemporaryDirectory() as temporary:
+            build, mod = self._layout(Path(temporary))
+            backup = build.parent / (build.name + ".previous")
+            backup.mkdir()
+            (backup / "newer.txt").write_text("newer", encoding="utf-8")
+            (mod / "old.txt").write_text("hand-edited", encoding="utf-8")
+            old = time.time() - 3600
+            os.utime(mod, (old, old))       # the mod dir looks OLDER
+            with self.assertRaises(RuntimeError) as caught:
+                xedit.swap_output_into_mod(build, mod, log_fn=lambda _m: None)
+            self.assertIn("NEWER", str(caught.exception))
+            # Nothing was discarded, nothing moved.
+            self.assertTrue((backup / "newer.txt").is_file())
+            self.assertEqual((mod / "old.txt").read_text(encoding="utf-8"),
+                             "hand-edited")
+            self.assertEqual({p.name for p in build.iterdir()},
+                             {"new1.txt", "new2.txt"})
+
+    def test_swap_cleanup_failure_never_blocks_the_next_run(self) -> None:
+        """A failed backup cleanup leaves INERT trash (never
+        '<build>.previous'): a partial rmtree bumps mtimes, which would make
+        the next run's recency guard refuse a state the tool created
+        itself."""
+        import time
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as temporary:
+            build, mod = self._layout(Path(temporary))
+            backup = build.parent / (build.name + ".previous")
+            old_time = time.time() - 3600
+            os.utime(build, (old_time, old_time))   # will become the mod
+            # The swap succeeds but the trash removal fails afterwards.
+            with mock.patch("Utils.bethesda.xedit.shutil.rmtree",
+                            side_effect=OSError("injected cleanup failure")):
+                installed = xedit.swap_output_into_mod(
+                    build, mod, log_fn=lambda _m: None)
+            self.assertEqual(installed, 2)
+            self.assertEqual({p.name for p in mod.iterdir()},
+                             {"new1.txt", "new2.txt"})
+            # No '.previous' backup remains - only inert trash.
+            self.assertFalse(backup.exists())
+            self.assertTrue(
+                any(p.name.startswith(build.name + ".previous.trash-")
+                    for p in build.parent.iterdir()),
+                list(build.parent.iterdir()))
+            # The next run's recovery must not refuse this state.
+            xedit.recover_swap_leftovers(build, mod, log_fn=lambda _m: None)
+            self.assertEqual({p.name for p in mod.iterdir()},
+                             {"new1.txt", "new2.txt"})
+
+    def test_recovery_refuses_when_ages_are_unknown(self) -> None:
+        """Uncertainty must never pick the destructive branch (dropping the
+        backup deletes data): when the ages cannot be compared the recovery
+        refuses loudly and both copies survive."""
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as temporary:
+            build, mod = self._layout(Path(temporary))
+            backup = build.parent / (build.name + ".previous")
+            backup.mkdir()
+            (backup / "older.txt").write_text("older", encoding="utf-8")
+            (mod / "old.txt").write_text("later", encoding="utf-8")
+            os.utime(mod, None)
+            real_stat = Path.stat
+
+            class _Ageless:
+                def __init__(self, real):
+                    self._real = real
+
+                def __getattr__(self, name):
+                    return getattr(self._real, name)
+
+                @property
+                def st_mtime(self):
+                    raise OSError("injected stat failure")
+
+            def fake_stat(self, *args, **kwargs):
+                st = real_stat(self, *args, **kwargs)
+                return _Ageless(st) if self == mod else st
+
+            with mock.patch("pathlib.Path.stat", fake_stat):
+                with self.assertRaises(RuntimeError) as caught:
+                    xedit.swap_output_into_mod(build, mod,
+                                               log_fn=lambda _m: None)
+            self.assertIn("refusing to discard either copy",
+                          str(caught.exception))
+            # Nothing was discarded.
+            self.assertTrue((backup / "older.txt").is_file())
+            self.assertEqual((mod / "old.txt").read_text(encoding="utf-8"),
+                             "later")
+
+    def test_swap_refuses_cross_filesystem_layout(self) -> None:
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as temporary:
+            build, mod = self._layout(Path(temporary))
+            real_stat = Path.stat
+
+            def fake_stat(self, *args, **kwargs):
+                st = real_stat(self, *args, **kwargs)
+                if self.name == "Mod.build":
+                    return os.stat_result((
+                        st.st_mode, st.st_ino, st.st_dev + 1, st.st_nlink,
+                        st.st_uid, st.st_gid, st.st_size, st.st_atime,
+                        st.st_mtime, st.st_ctime))
+                return st
+
+            with mock.patch("pathlib.Path.stat", fake_stat):
+                with self.assertRaises(RuntimeError) as caught:
+                    xedit.swap_output_into_mod(build, mod)
+            self.assertIn("filesystem", str(caught.exception))
+            # Loud check before anything moved.
+            self.assertEqual({p.name for p in mod.iterdir()}, {"old.txt"})
+            self.assertEqual({p.name for p in build.iterdir()},
+                             {"new1.txt", "new2.txt"})
+
+
+class StagingScanFilterTests(unittest.TestCase):
+    def test_staging_mod_dirs_skips_reserved_names(self) -> None:
+        """The shared staging scan (modlist sync + filegraph) never adopts or
+        scans reserved infrastructure/scratch names, but keeps every real mod
+        - ".build" names included."""
+        from Utils.mods.names import staging_mod_dirs
+        with tempfile.TemporaryDirectory() as temporary:
+            staging = Path(temporary)
+            (staging / "RealMod").mkdir()
+            (staging / "X.build").mkdir()
+            (staging / "Sep_separator").mkdir()
+            (staging / ".amethyst-build").mkdir()
+            (staging / "Overwrite").mkdir()      # reserved, case-insensitive
+            (staging / "a-file.txt").write_text("x", encoding="utf-8")
+            names = sorted(p.name for p in staging_mod_dirs(staging))
+            self.assertEqual(names, ["RealMod", "X.build"])
+
+
+class WizardScratchSyncTests(unittest.TestCase):
+    def test_sync_keeps_x_build_mods_and_skips_the_scratch_root(self) -> None:
+        """C-1 regression: a real mod ending in ".build" keeps its entry
+        (enabled/order/locked state is unrecoverable once dropped), while the
+        reserved ".amethyst-build" scratch root is never adopted or renamed.
+        A NEW "X.build" folder is an ordinary mod: adopted (disabled) like
+        any other."""
+        from Utils.mods.modlist import (
+            read_modlist, sync_modlist_with_mods_folder)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            mods = root / "mods"
+            mods.mkdir()
+            (mods / "RealMod").mkdir()
+            real = mods / "MyMod.build"
+            real.mkdir()
+            (real / "content.esp").write_text("real mod content",
+                                              encoding="utf-8")
+            weird = mods / "X.build .build"
+            weird.mkdir()
+            (weird / "x.esp").write_text("x", encoding="utf-8")
+            scratch = mods / ".amethyst-build"
+            (scratch / "TexGen_Output_default.build").mkdir(parents=True)
+            backup = scratch / "TexGen_Output_default.build.previous"
+            backup.mkdir()
+            (backup / "old.txt").write_text("old", encoding="utf-8")
+            modlist = root / "modlist.txt"
+            modlist.write_text("+MyMod.build\n*RealMod\n", encoding="utf-8")
+            sync_modlist_with_mods_folder(modlist, mods)
+            names = [e.name for e in read_modlist(modlist)]
+            entries = {e.name: e for e in read_modlist(modlist)}
+            # The legit ".build" mod keeps its entry AND its flags/order (the
+            # odd "X.build .build" name is adopted as an ordinary disabled
+            # mod, like any unlisted folder).
+            self.assertEqual(names,
+                             ["X.build .build", "MyMod.build", "RealMod"])
+            self.assertTrue(entries["MyMod.build"].enabled)
+            self.assertTrue(entries["RealMod"].locked)
+            # The reserved scratch root is invisible to the sync - its
+            # content is untouched (the wizard recovers it).
+            self.assertNotIn(".amethyst-build", entries)
+            self.assertTrue((backup / "old.txt").is_file())
+            # A brand-new X.build folder is adopted like any other mod.
+            (mods / "X.build").mkdir()
+            (mods / "X.build" / "new.esp").write_text("new", encoding="utf-8")
+            sync_modlist_with_mods_folder(modlist, mods)
+            names = [e.name for e in read_modlist(modlist)]
+            entries = {e.name: e for e in read_modlist(modlist)}
+            self.assertEqual(names[0], "X.build")
+            self.assertFalse(entries["X.build"].enabled)
+
+
+class OutputModNamingTests(unittest.TestCase):
+    def test_per_profile_output_mod_name(self) -> None:
+        self.assertEqual(
+            xedit.per_profile_output_mod_name("TexGen_Output", "default"),
+            "TexGen_Output_default")
+        self.assertEqual(
+            xedit.per_profile_output_mod_name("TexGen_Output", "heavy"),
+            "TexGen_Output_heavy")
+        # Filesystem-hostile profile names are sanitized, never passed through.
+        name = xedit.per_profile_output_mod_name("TexGen_Output", "a/b:c")
+        self.assertNotIn("/", name)
+        self.assertNotIn(":", name)
+
+    def test_sanitized_profiles_never_collide(self) -> None:
+        # "a/b" and "ab" sanitize to the same base name - the hash suffix
+        # derived from the raw spelling keeps their output mods distinct.
+        slashed = xedit.per_profile_output_mod_name("TexGen_Output", "a/b")
+        plain = xedit.per_profile_output_mod_name("TexGen_Output", "ab")
+        self.assertNotEqual(slashed, plain)
+        self.assertTrue(slashed.startswith("TexGen_Output_ab_"), slashed)
+        # Deterministic across calls.
+        self.assertEqual(
+            slashed, xedit.per_profile_output_mod_name("TexGen_Output", "a/b"))
+
+    def test_output_mod_build_dir_is_staging_side(self) -> None:
+        staging = Path("/profiles/game/mods")
+        self.assertEqual(
+            xedit.output_mod_build_dir(staging, "TexGen_Output_default"),
+            staging / ".amethyst-build" / "TexGen_Output_default.build")
+
+    def test_set_mod_enabled_toggles_in_place(self) -> None:
+        from Utils.mods.modlist import (
+            ModEntry, prepend_mod, read_modlist, set_mod_enabled, write_modlist,
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            modlist = Path(temporary) / "modlist.txt"
+            prepend_mod(modlist, "Other", enabled=True)
+            prepend_mod(modlist, "Output", enabled=True)
+            self.assertTrue(set_mod_enabled(modlist, "Output", False))
+            entries = read_modlist(modlist)
+            self.assertEqual([e.name for e in entries], ["Output", "Other"])
+            self.assertFalse(entries[0].enabled)
+            self.assertTrue(entries[1].enabled)
+            self.assertTrue(set_mod_enabled(modlist, "Output", True))
+            self.assertTrue(read_modlist(modlist)[0].enabled)
+            self.assertFalse(set_mod_enabled(modlist, "Missing", False))
+
+            # Locked ("*") entries are never toggled - and a toggle that did
+            # not take effect must REPORT False: the requested state is NOT
+            # in effect, so an enforcing caller cannot assume it (B2: a locked
+            # output mod defeats the deactivation while looking successful).
+            write_modlist(modlist, [
+                ModEntry(name="Locked", enabled=True, locked=True),
+                ModEntry(name="Plain", enabled=True, locked=False),
+            ])
+            self.assertFalse(set_mod_enabled(modlist, "Locked", False))
+            self.assertTrue(set_mod_enabled(modlist, "Plain", False))
+            entries = {e.name: e for e in read_modlist(modlist)}
+            self.assertTrue(entries["Locked"].enabled)
+            self.assertFalse(entries["Plain"].enabled)
+            # A locked entry ALREADY in the requested state reports truthfully:
+            # the flag IS in the requested state, nothing needed toggling.
+            self.assertTrue(set_mod_enabled(modlist, "Locked", True))
+
+            # Separators are never toggled either (never a matching entry).
+            write_modlist(modlist, [
+                ModEntry(name="Sep_separator", enabled=True, locked=False,
+                         is_separator=True),
+            ])
+            self.assertFalse(set_mod_enabled(modlist, "Sep_separator", False))
+
+    def test_set_mod_enabled_writes_only_on_change(self) -> None:
+        from unittest import mock
+        from Utils.mods.modlist import prepend_mod, set_mod_enabled
+        with tempfile.TemporaryDirectory() as temporary:
+            modlist = Path(temporary) / "modlist.txt"
+            prepend_mod(modlist, "Output", enabled=True)
+            with mock.patch("Utils.mods.modlist.write_modlist") as write:
+                # Already in the requested state: no rewrite.
+                self.assertTrue(set_mod_enabled(modlist, "Output", True))
+                write.assert_not_called()
+                # A real change writes exactly once.
+                self.assertTrue(set_mod_enabled(modlist, "Output", False))
+                write.assert_called_once()
 
 
 if __name__ == "__main__":

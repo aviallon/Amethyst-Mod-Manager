@@ -5,6 +5,35 @@ Used by install_mod, dialogs (NameModDialog), and modlist_panel. No dependency o
 
 import re
 import unicodedata
+from pathlib import Path
+
+
+# Profile-root infrastructure folder names. If one of these turns up *inside*
+# the mods/ staging folder it's almost always stray/test pollution (a mirror of
+# the profile-root layout), never a real mod - so neither the modlist sync nor
+# the filegraph staging scans may adopt/scan it. Case-insensitive match.
+RESERVED_STAGING_NAMES = frozenset({
+    "mods", "overwrite", "profiles", "backups",
+    "root_folder", "applications",
+    # Wizard scratch root: tool build dirs and crash-recovery backups live
+    # INSIDE it (see Utils.bethesda.xedit.output_mod_build_dir). One reserved
+    # name, never a suffix match - a real mod may legitimately end in
+    # ".build" and must keep its entry.
+    ".amethyst-build",
+})
+
+
+def staging_mod_dirs(staging: Path) -> list[Path]:
+    """Mod folders under *staging*: skips MO2 separators and reserved
+    infrastructure/scratch names. Shared by the modlist sync and the
+    filegraph staging scans so the reserved names are honoured everywhere."""
+    try:
+        entries = list(staging.iterdir())
+    except OSError:
+        return []
+    return [entry for entry in entries
+            if entry.is_dir() and not entry.name.endswith("_separator")
+            and entry.name.lower() not in RESERVED_STAGING_NAMES]
 
 
 # Characters Windows/Wine forbid in a path component.  Mods are deployed and

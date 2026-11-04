@@ -34,6 +34,7 @@ import subprocess
 import threading
 import re
 from pathlib import Path
+from collections.abc import Sequence
 
 from Utils.config_paths import (
     get_exe_args_path,
@@ -2718,14 +2719,37 @@ def resolve_tool_prefix(exe: Path, game, proton_name: str, prefix_mode: str,
 
 
 def wrap_tool_command(game, command: list[str], env: dict,
-                      log_fn=_noop_log, label: str = "Tool") -> list[str]:
-    """Run a wizard command in its profile's published game view when present."""
+                      log_fn=_noop_log, label: str = "Tool",
+                      mask_paths: "Sequence[Path | str]" = ()) -> list[str]:
+    """Run a wizard command in its profile's published game view when present.
+
+    *mask_paths* hides those game-root paths for the launched tool only (see
+    ``Utils.vfs.wrap_command``); an empty list changes nothing. A non-empty
+    mask REQUIRES the profile VFS: without a game or a deployed manifest the
+    launch would run outside any mount namespace and the masked paths would
+    stay visible, so this raises instead of silently launching with the
+    masks dropped.
+    """
+    masks = [str(mask) for mask in mask_paths]
     if game is None:
+        if masks:
+            raise RuntimeError(
+                "cannot hide masked paths (" + ", ".join(masks) + ") for "
+                f"{label}: no game is bound to this launch, so there is no "
+                "profile VFS mount namespace to hide them in")
         return command
     from Utils.vfs import manifest_path, wrap_command
-    if not manifest_path(game).is_file():
+    manifest = manifest_path(game)
+    if not manifest.is_file():
+        if masks:
+            raise RuntimeError(
+                "cannot hide masked paths (" + ", ".join(masks) + ") for "
+                f"{label}: the profile has no deployed VFS manifest "
+                f"({manifest}), so the launch runs without a mount namespace "
+                "and the paths would stay visible")
         return command
-    wrapped = wrap_command(game, command, env=env, log_fn=log_fn)
+    wrapped = wrap_command(game, command, env=env, log_fn=log_fn,
+                           mask_paths=mask_paths)
     log_fn(f"{label}: using the deployed profile VFS game view.")
     return wrapped
 
@@ -2742,6 +2766,7 @@ def run_tool_logged(
     winedebug: str = "+err,+warn,fixme-all",
     game=None,
     owner=None,
+    mask_paths: "Sequence[Path | str]" = (),
 ) -> int:
     """Launch *exe* through Proton and stream its output to *log_fn*.
 
@@ -2756,6 +2781,9 @@ def run_tool_logged(
     Blocks until the process exits (call from a worker thread) and returns the
     exit code. *proton_script* and *env* come from ``resolve_tool_prefix``;
     *extra_args* are appended after the exe (e.g. xEdit's data-path flag).
+    *mask_paths* hides those game-root paths inside the tool's mount namespace
+    only (both the Proton and the winetricks-style launch honour them; a VFS
+    backend that cannot mask raises instead of dropping them).
 
     The launch is registered in the live-tool registry for as long as it runs,
     so ``reap_live_tools`` can kill a tool that finishes its work and then
@@ -2784,7 +2812,8 @@ def run_tool_logged(
                 proton_script, exe, Path(prefix), log_fn=log_fn,
                 extra_args=extra_args,
                 extra_env={key: env.get(key) for key in gpu_env_keys},
-                cwd=cwd, label=label, game=game, owner=owner)
+                cwd=cwd, label=label, game=game, owner=owner,
+                mask_paths=mask_paths)
         log_fn(f"{label}: winetricks-style launch requested but no prefix "
                "path in env - falling back to Proton.")
 
@@ -2824,7 +2853,8 @@ def run_tool_logged(
     # Bind the published view over the configured game directory around the
     # *whole tool process* instead. Registry/config paths remain the ordinary
     # game paths and Wine tools see exactly the same resolved files as Skyrim.
-    cmd = wrap_tool_command(game, cmd, env, log_fn=log_fn, label=label)
+    cmd = wrap_tool_command(game, cmd, env, log_fn=log_fn, label=label,
+                            mask_paths=mask_paths)
 
     try:
         proc = subprocess.Popen(
@@ -2880,6 +2910,7 @@ def run_tool_winetricks_style(
     label: str | None = None,
     game=None,
     owner=None,
+    mask_paths: "Sequence[Path | str]" = (),
 ) -> int:
     """Launch *exe* exactly the way winetricks' "Run an arbitrary executable"
     does: plain ``wine start.exe`` against WINEPREFIX, no ``proton`` script.
@@ -2944,7 +2975,8 @@ WINEPREFIX + Proton's bin on PATH, ``wine start.exe <exe>``), with only two
     cmd = [str(wine_bin), "start.exe", "/wait", "/unix", str(exe)]
     if extra_args:
         cmd = cmd + list(extra_args)
-    cmd = wrap_tool_command(game, cmd, env, log_fn=log_fn, label=label)
+    cmd = wrap_tool_command(game, cmd, env, log_fn=log_fn, label=label,
+                            mask_paths=mask_paths)
     log_fn(f"{label}: launching with plain Wine (winetricks-style): "
            f"{' '.join(cmd)}")
     cmd, env = game_process.prepare_spawn(cmd, env)

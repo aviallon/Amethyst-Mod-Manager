@@ -10,11 +10,13 @@ download/locate/extract lives in Utils.wizards.archives.
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import os
 import re as _re
 import shutil
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -535,6 +537,222 @@ def applications_dir(game: "BaseGame", app_dir: str) -> Path:
 def tool_exe_path(game: "BaseGame", exe_name: str, app_dir: str) -> Path | None:
     p = applications_dir(game, app_dir) / exe_name
     return p if p.is_file() else None
+
+
+def per_profile_output_mod_name(base: str, profile: str) -> str:
+    """Per-profile output-capture mod name, e.g. TexGen_Output_<profile>.
+
+    Suffixing the profile keeps two profiles' outputs in separate mod folders
+    instead of overwriting each other through one shared staging folder.
+    Sanitizing must never make two different profiles collide ("a/b" and
+    "ab" would both strip to the same name), so a name that had to be
+    sanitized carries a short hash of the raw spelling to stay unique.
+    """
+    from Utils.bethesda.bodyslide import sanitize_output_name
+    raw = f"{base}_{profile}"
+    name = sanitize_output_name(raw, raw)
+    if name != raw:
+        digest = hashlib.sha1(
+            raw.encode("utf-8", "surrogateescape")).hexdigest()[:8]
+        name = sanitize_output_name(f"{name}_{digest}", f"{base}_{digest}")
+    return name
+
+
+def output_mod_build_dir(staging: Path, output_mod_name: str) -> Path:
+    """Clean scratch dir a wizard tool generates output into before the swap.
+
+    Lives under the reserved ``.amethyst-build`` root inside the staging tree:
+    same filesystem as the output mod (so the post-run swap is a cheap
+    rename) but in a name space the modlist sync never adopts or renames - a
+    plain ``<name>.build`` beside the mods would collide with a real mod that
+    happens to end in ``.build``. It is consumed by
+    :func:`swap_output_into_mod` on success and removed (logged) on failure:
+    it must never survive the run.
+    """
+    return staging / ".amethyst-build" / f"{output_mod_name}.build"
+
+
+def _remove_path_quietly(path: Path) -> bool:
+    """Best-effort removal of a file or directory tree; returns success."""
+    try:
+        if path.is_dir() and not path.is_symlink():
+            shutil.rmtree(path)
+        else:
+            path.unlink(missing_ok=True)
+        return True
+    except OSError:
+        return False
+
+
+def _quarantine_and_remove(path: Path, log_fn=_noop) -> bool:
+    """Remove *path* by first renaming it to inert trash.
+
+    The rename matters: a partial rmtree bumps directory mtimes (child
+    deletions), so debris still named ``<build>.previous`` would make the
+    next run's recency guard treat the tool's own half-deleted trash as an
+    ambiguous backup. Trash is never looked at by the recovery. Returns True
+    when *path* is out of the recovery namespace (even if the trash itself
+    could not be fully removed); False only when *path* still sits under its
+    original name.
+    """
+    trash = path.parent / f"{path.name}.trash-{time.time_ns()}"
+    try:
+        os.replace(path, trash)
+    except OSError as exc:
+        log_fn(f"WARN: could not quarantine '{path.name}' for removal "
+               f"({exc}); removing it in place.")
+        return _remove_path_quietly(path)
+    if not _remove_path_quietly(trash):
+        log_fn(f"WARN: could not fully remove the inert trash '{trash}' - "
+               "remove it by hand.")
+    return True
+
+
+def recover_swap_leftovers(build_dir: Path, mod_dir: Path, *,
+                           log_fn=_noop) -> None:
+    """Entry-time crash recovery for the build -> mod swap.
+
+    A leftover backup (``<build>.previous``) is the output mod's previous
+    content - possibly the ONLY complete copy after a crash between the two
+    renames. ``ensure_output_mod`` recreates the mod dir as an EMPTY
+    placeholder on the next wizard run, so "the mod dir exists" is NOT proof
+    that the backup is stale - only content is:
+
+    * the mod dir is missing or an empty placeholder -> the backup holds the
+      live previous content and is restored first (the swap re-stages and
+      re-installs afterwards, so restoring is always safe);
+    * the mod dir is non-empty -> it USUALLY holds the later content (a swap
+      that completed its install but crashed before cleanup); only then is
+      the older backup removed - and only when the mod dir is at least as new
+      as the backup (a hand-edited folder can be older, and "non-empty" is
+      not proof of recency: the backup stays and the call refuses loudly
+      rather than discard either copy).
+
+    A restore that cannot complete raises loudly and leaves the backup in
+    place - the previous output is never deleted to make progress.
+    """
+    backup = build_dir.parent / (build_dir.name + ".previous")
+    if not backup.exists():
+        return
+    try:
+        later_content_present = mod_dir.is_dir() and any(mod_dir.iterdir())
+    except OSError:
+        # Cannot inspect the mod dir: take the data-preserving restore path
+        # rather than propagating or guessing authority.
+        later_content_present = False
+    if later_content_present:
+        try:
+            mod_mtime = mod_dir.stat().st_mtime
+            backup_mtime = backup.stat().st_mtime
+        except OSError as exc:
+            # Uncertainty must never pick the destructive branch (dropping
+            # the backup deletes data): refuse loudly instead.
+            raise RuntimeError(
+                f"cannot compare the ages of '{mod_dir.name}' and "
+                f"'{backup.name}' ({exc}) - refusing to discard either copy "
+                "on uncertainty; resolve by hand") from exc
+        if backup_mtime > mod_mtime:
+            raise RuntimeError(
+                f"'{backup.name}' is NEWER than the non-empty '{mod_dir.name}' "
+                "- cannot tell which one holds the wanted output (a "
+                "hand-edited folder?); refusing to discard either - resolve "
+                "by hand")
+        log_fn(f"NOTE: removing the stale swap backup '{backup.name}': "
+               f"'{mod_dir.name}' already holds the later output (a swap that "
+               "completed but failed to clean up).")
+        if not _quarantine_and_remove(backup, log_fn):
+            raise RuntimeError(
+                f"could not remove the stale swap backup '{backup}' left by "
+                "a previous run's failed cleanup")
+        return
+    log_fn(f"WARN: '{mod_dir.name}' is missing or an empty placeholder while "
+           f"'{backup.name}' holds the previous output (a crashed swap); "
+           "restoring it.")
+    try:
+        os.replace(backup, mod_dir)
+    except OSError as exc:
+        if exc.errno in (errno.ENOTEMPTY, errno.EEXIST, errno.ENOTDIR):
+            raise RuntimeError(
+                f"cannot restore '{mod_dir.name}' from its crashed-swap "
+                f"backup '{backup.name}': the mod dir is not empty (or not a "
+                "directory) and must not be overwritten - the backup is "
+                f"intact, resolve by hand ({exc})") from exc
+        raise RuntimeError(
+            f"could not restore '{mod_dir.name}' from its crashed-swap "
+            f"backup '{backup.name}': {exc}"
+        ) from exc
+
+
+def swap_output_into_mod(build_dir: Path, mod_dir: Path, *,
+                         log_fn=_noop) -> int:
+    """Install a completed tool output into the output mod, replacing old content.
+
+    The swap is two whole-directory renames (``mod_dir`` staged aside to a
+    backup, then ``build_dir`` renamed into place), each atomic on its own
+    filesystem, so a crash at ANY point leaves either the complete old or the
+    complete new content in the mod - never a half-written mix (a per-child
+    move loop could be killed halfway and leave both halves broken). The
+    build dir is consumed by the rename: nothing is left behind for a modlist
+    sync to adopt as a junk entry. Returns the number of top-level items
+    installed.
+
+    Crash recovery on entry (see :func:`recover_swap_leftovers`): a leftover
+    backup with NO mod dir - or with an empty placeholder mod dir, as
+    ``ensure_output_mod`` recreates after a crash - is restored first; only a
+    NON-EMPTY mod dir is proof of later content, and only then is the older
+    backup removed.
+    """
+    if not build_dir.is_dir():
+        raise RuntimeError(f"tool output directory is missing: {build_dir}")
+    items = sorted(child.name for child in build_dir.iterdir())
+    if not items:
+        raise RuntimeError(
+            f"tool output directory is empty: {build_dir} - the run produced "
+            "no output")
+    mod_dir.parent.mkdir(parents=True, exist_ok=True)
+    backup = build_dir.parent / (build_dir.name + ".previous")
+    # Whole-directory renames only work inside one filesystem - say so now
+    # instead of letting os.replace fail halfway through the swap.
+    build_dev = build_dir.stat().st_dev
+    for label, probe in (("mod directory parent", mod_dir.parent),
+                         ("mod directory", mod_dir)):
+        if probe.exists() and probe.stat().st_dev != build_dev:
+            raise RuntimeError(
+                f"cannot swap '{build_dir.name}' into '{mod_dir.name}': the "
+                f"{label} is on a different filesystem than the build "
+                "directory (the atomic rename swap requires one)")
+    recover_swap_leftovers(build_dir, mod_dir, log_fn=log_fn)
+    had_previous = mod_dir.exists()
+    if had_previous:
+        try:
+            os.replace(mod_dir, backup)
+        except OSError as exc:
+            raise RuntimeError(
+                f"could not stage the previous '{mod_dir.name}' content "
+                f"aside: {exc}"
+            ) from exc
+    try:
+        os.replace(build_dir, mod_dir)
+    except OSError as exc:
+        # Roll back with the single restore rename. Best-effort by design:
+        # a failure in here must never mask the original error.
+        if had_previous and not mod_dir.exists():
+            try:
+                os.replace(backup, mod_dir)
+                log_fn(f"WARN: installing the tool output failed ({exc}); "
+                       f"the previous '{mod_dir.name}' content was restored.")
+            except OSError as restore_exc:
+                log_fn(f"WARN: installing the tool output failed ({exc}) AND "
+                       f"restoring '{mod_dir.name}' from '{backup.name}' also "
+                       f"failed ({restore_exc}) - recover it by hand.")
+        raise RuntimeError(
+            f"could not install the tool output into '{mod_dir.name}': {exc}"
+        ) from exc
+    if had_previous and not _quarantine_and_remove(backup, log_fn):
+        log_fn(f"WARN: could not clear the previous content backup "
+               f"'{backup}' - its state may confuse the next run's crash "
+               "recovery; delete it by hand.")
+    return len(items)
 
 
 def flatten_subdirs(dest: Path, exe_name: str) -> None:

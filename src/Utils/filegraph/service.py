@@ -27,6 +27,7 @@ from Utils.filegraph.models import (
     RefreshProgress, ResolutionDelta, SnapshotExport, Winner,
 )
 from Utils.filegraph.native import pack, require_native, unpack
+from Utils.mods.names import staging_mod_dirs
 
 
 def _native_error(exc: BaseException) -> BaseException:
@@ -1358,8 +1359,11 @@ class LibrarySession:
             names = {name.lower(): name for name in fingerprints}
             previous = {name.lower(): value for name, value in fingerprints.items()}
             variants = self.variant_keys()
-            roots = {entry.name: entry for entry in sorted(adapter.staging.iterdir())
-                     if entry.is_dir() and not entry.name.endswith("_separator")}
+            # staging_mod_dirs skips MO2 separators AND the reserved
+            # infrastructure/scratch names (see Utils.mods.names); sorted()
+            # keeps the scan order deterministic.
+            roots = {entry.name: entry
+                     for entry in sorted(staging_mod_dirs(adapter.staging))}
             roots[OVERWRITE_NAME] = adapter.overwrite
             roots[ROOT_FOLDER_NAME] = adapter.root_folder
             removed = previous.keys() - {name.lower() for name in roots}

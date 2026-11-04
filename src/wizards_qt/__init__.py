@@ -116,6 +116,32 @@ def notify_wizard_output(ctx, reason: str, log_fn=None) -> None:
             log_fn(f"Could not mark staging dirty: {exc}")
 
 
+def release_on_main(set_lock) -> None:
+    """Call ``set_lock(False)`` on the GUI thread from a worker thread.
+
+    Used as the OUTERMOST ``finally`` of a wizard worker to release a
+    ``set_tool_lock`` hold (see :class:`QtWizardContext`). Falls back to a
+    direct call if there is no QApplication to hop through - leaving the
+    lock held would be far worse than a cross-thread release of what is only
+    a dict write plus a setEnabled. What matters is that ``set_lock`` still
+    calls cleanly after the wizard view is gone: release through this helper
+    (a receiver-less timer on the QApplication), never through a Signal of
+    the view - safe_emit drops those once the view is deleted. The
+    QApplication is the timer context, NOT the view: the receiver-less
+    singleShot overload builds its timer in the calling (worker) thread,
+    which has no event loop, and a view context would be gone mid-run."""
+    try:
+        from PySide6.QtCore import QTimer
+        from PySide6.QtWidgets import QApplication
+        app = QApplication.instance()
+        if app is not None:
+            QTimer.singleShot(0, app, lambda: set_lock(False))
+            return
+    except Exception:
+        pass
+    set_lock(False)
+
+
 # Deliberately dropped from the Qt app (not even shown greyed out).
 EXCLUDED: frozenset[str] = frozenset({
     "wizards.bepinex.BepInExWizard",

@@ -28,6 +28,7 @@ from Utils.filegraph.identities import (
 )
 from Utils.games.conflict_blacklist import path_is_ignored
 from Utils.games.frameworks import framework_exe_candidates
+from Utils.mods.names import staging_mod_dirs
 
 # Candidate flags consumed directly by ConflictSummary/UI filters.
 FLAG_PRE_RTX = 1 << 0
@@ -1445,13 +1446,10 @@ class GameCandidateAdapter:
         self.prepare_profile_rules()
         self._archive_units.clear()
         if mod_names is None:
-            try:
-                names = sorted(
-                    entry.name for entry in self.staging.iterdir()
-                    if entry.is_dir() and not entry.name.endswith("_separator")
-                )
-            except OSError:
-                names = []
+            # staging_mod_dirs skips separators AND reserved infrastructure
+            # names (e.g. the wizard scratch root): scanning them would
+            # fingerprint multi-GB scratch churn as a mod root.
+            names = sorted(entry.name for entry in staging_mod_dirs(self.staging))
             names.append(OVERWRITE_NAME)
             names.append(ROOT_FOLDER_NAME)
         else:
