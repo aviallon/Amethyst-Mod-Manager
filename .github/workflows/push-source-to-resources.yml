@@ -22,8 +22,34 @@ permissions:
   contents: write
 
 jobs:
+  # Automatic runtime-drift rebuilds are tagged with an `N.M` counter; their own
+  # workflow already handled them and this one must not run again.
+  gate:
+    name: Skip automatic rebuild tags
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      auto: ${{ steps.c.outputs.auto }}
+    steps:
+      - id: c
+        shell: bash
+        env:
+          EVENT: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          auto=false
+          if [ "$EVENT" = "push" ] && [[ "$REF_NAME" == *-viallon* ]]; then
+            case "${REF_NAME##*-viallon}" in *.*) auto=true ;; esac
+          fi
+          echo "auto=$auto" >> "$GITHUB_OUTPUT"
+          echo "automatic rebuild tag: $auto"
+
   push-source:
     name: Copy amethyst_en.ts to Resources
+    needs: gate
+    if: needs.gate.outputs.auto != 'true'
     runs-on: ubuntu-latest
     steps:
       # Full history: this commits onto a branch other than the tagged ref.
