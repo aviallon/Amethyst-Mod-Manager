@@ -1,0 +1,38 @@
+name: token tag test (throwaway)
+
+# Diagnostic only: does GITHUB_TOKEN, with contents: write, manage to push a
+# tag whose commit touches a workflow file? Delete this workflow afterwards.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  try-tag-push:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Try to push a tag on a workflow-touching commit with GITHUB_TOKEN
+        id: push
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          tag="token-test-${{ github.run_id }}"
+          echo "HEAD=$(git rev-parse HEAD)"
+          git tag "$tag" HEAD
+          git push origin "refs/tags/$tag"
+
+      - name: Verdict
+        run: |
+          if [ "${{ steps.push.outcome }}" = "success" ]; then
+            echo "VERDICT: GITHUB_TOKEN CAN push a workflow-touching tag"
+          else
+            echo "VERDICT: GITHUB_TOKEN CANNOT push a workflow-touching tag"
+          fi
