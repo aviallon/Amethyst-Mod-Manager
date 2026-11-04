@@ -198,6 +198,18 @@ jobs:
             exit 1
           fi
 
+          # An `N.M` tag is created by the drift rebuild itself, whose run has
+          # already built and published this version. A PAT (unlike
+          # GITHUB_TOKEN) does start a run when `finalize` pushes that tag, so
+          # skip it here to avoid a duplicate build+publish (release.yml and
+          # push-source-to-resources.yml carry the same guard).
+          if [[ "$n" == *.* ]]; then
+            echo "Tag \`$tag\` is an automatic rebuild tag; already built by the drift run. Nothing to do."
+            out rebuild false; out tag ""; out ostree "$ch"; out subject ""; out dry false
+            out build_ref "refs/heads/$DEFAULT_BRANCH"; out build_sha ""
+            exit 0
+          fi
+
           {
             echo "### Flatpak publish"
             echo
@@ -356,10 +368,45 @@ jobs:
           # where the pins commit cannot be pushed.
           ref: ${{ github.event.repository.default_branch }}
           fetch-depth: 0
+          # Push with a PAT when available: GITHUB_TOKEN is refused any ref whose
+          # commit touches a workflow file ("without `workflows` permission"),
+          # which is exactly what the release commits do. Falls back to
+          # GITHUB_TOKEN (the pins push still works, the tag push then warns).
+          token: ${{ secrets.AMETHYST_PUSH_TOKEN || github.token }}
 
-      # Only after a *successful* publish: a failed build must not advance the
-      # pins, or the next schedule would consider the drift already handled.
+      # The auto tag matches the `v*-viallon*` push trigger; the tag-push path
+      # ignores `N.M` tags precisely so this cannot double-build. It runs BEFORE
+      # the pins on purpose: if the tag push fails, the pins stay un-advanced so
+      # the next schedule re-fires the drift and retries the tag. Best effort:
+      # the failure is a warning, not a red run after a successful publish.
+      - name: Tag the automatic rebuild (viallonN.M), if any
+        id: tag
+        if: needs.meta.outputs.tag != ''
+        continue-on-error: true
+        env:
+          TAG: ${{ needs.meta.outputs.tag }}
+          SHA: ${{ needs.meta.outputs.build_sha }}
+        run: |
+          set -euo pipefail
+          if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+            echo "tag $TAG already exists; nothing to do"
+            exit 0
+          fi
+          git tag "$TAG" "$SHA"
+          if git push origin "$TAG"; then
+            echo "pushed $TAG" | tee -a "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::warning::could not push tag $TAG — check that AMETHYST_PUSH_TOKEN has Contents: write and Workflows: write"
+            exit 1
+          fi
+
+      # Only after a *successful* publish, and only if the tag above did not
+      # fail: a failed build or tag must not advance the pins, or the next
+      # schedule would consider the drift already handled. An invalid or
+      # under-scoped PAT makes this push fail on purpose: the pins must land,
+      # otherwise every schedule would re-fire the drift rebuild.
       - name: Record the base/runtime commits used
+        if: steps.tag.outcome != 'failure'
         env:
           BASE: ${{ needs.meta.outputs.base_commit }}
           RUNTIME: ${{ needs.meta.outputs.runtime_commit }}
@@ -378,23 +425,3 @@ jobs:
           git add .github/flatpak-runtime-pins.json
           git diff --cached --quiet || git commit -m "chore(flatpak): pin runtime commits used by the last build"
           git push
-
-      # The auto tag below matches the `v*-viallon*` push trigger, but it is
-      # pushed with GITHUB_TOKEN and GitHub never starts a run for a GITHUB_TOKEN
-      # push — that, not this workflow, is what prevents a loop/double build. If
-      # the token is ever swapped for a PAT/App token, add an explicit
-      # `if: github.actor != 'github-actions[bot]'` guard on the build jobs.
-      - name: Tag the automatic rebuild (viallonN.M), if any
-        if: needs.meta.outputs.tag != ''
-        env:
-          TAG: ${{ needs.meta.outputs.tag }}
-          SHA: ${{ needs.meta.outputs.build_sha }}
-        run: |
-          set -euo pipefail
-          if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
-            echo "tag $TAG already exists; nothing to do"
-            exit 0
-          fi
-          git tag "$TAG" "$SHA"
-          git push origin "$TAG"
-          echo "pushed $TAG" | tee -a "$GITHUB_STEP_SUMMARY"
