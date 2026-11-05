@@ -60,7 +60,16 @@ jobs:
   build:
     name: Build
     needs: gate
-    if: needs.gate.outputs.auto != 'true'
+    # The fork builds and publishes its own `*-viallon*` tags through
+    # flatpak.yml (viallon OSTree channel + hub-viallon). This upstream pipeline
+    # must not also build them - least of all run its "Delete previous beta
+    # releases" step, which deletes other prerelease TAGS (--cleanup-tag) and
+    # would therefore silently move a later drift rebuild onto an older tag.
+    # The workflow is disabled on the fork today; this guard makes re-enabling
+    # it safe. Gating `build` skips `release` and `publish-pages` with it.
+    if: |
+      needs.gate.outputs.auto != 'true'
+      && !contains(github.ref_name, '-viallon')
     uses: ./.github/workflows/build.yml
     # Passes the FLATPAK_GPG_* secrets through so the flatpak job can sign its
     # export commits (required for the bundle's embedded --gpg-keys to verify).

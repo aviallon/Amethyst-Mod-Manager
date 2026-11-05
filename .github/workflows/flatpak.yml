@@ -64,6 +64,7 @@ jobs:
     outputs:
       ostree: ${{ steps.c.outputs.ostree }}
       subject: ${{ steps.c.outputs.subject }}
+      prerelease: ${{ steps.c.outputs.prerelease }}
       dry: ${{ steps.c.outputs.dry }}
       rebuild: ${{ steps.c.outputs.rebuild }}
       tag: ${{ steps.c.outputs.tag }}
@@ -128,7 +129,8 @@ jobs:
             pr=$(jq -r '.runtime // ""' "$pins" 2>/dev/null || echo "")
             if [ "$pb" = "$BASE" ] && [ "$pr" = "$RUNTIME" ]; then
               echo "No runtime drift; nothing to rebuild." | tee -a "$GITHUB_STEP_SUMMARY"
-              out rebuild false; out tag ""; out ostree stable; out subject ""; out dry false
+              out rebuild false; out tag ""; out ostree stable; out subject ""
+              out prerelease false; out dry false
               out build_ref "refs/heads/$DEFAULT_BRANCH"; out build_sha ""
               exit 0
             fi
@@ -165,37 +167,55 @@ jobs:
               echo "| runtime commit | \`$RUNTIME\` |"
             } >> "$GITHUB_STEP_SUMMARY"
 
-            out rebuild true; out tag "$next"; out ostree stable; out subject "$subj"; out dry "${IN_DRY:-false}"
+            out rebuild true; out tag "$next"; out ostree stable; out subject "$subj"
+            out prerelease false; out dry "${IN_DRY:-false}"
             out build_ref "refs/tags/$latest"; out build_sha "$(git rev-parse "refs/tags/$latest^{commit}")"
             exit 0
           fi
 
           # ---- workflow_dispatch ----
           if [ "$EVENT" = "workflow_dispatch" ]; then
+            # A manual publish IS a prerelease when it targets the beta channel:
+            # that is what the channel means, and the GitHub release must say so.
+            pre=false; [ "$IN_CHANNEL" = "beta" ] && pre=true
             out rebuild true; out tag ""; out ostree "$IN_CHANNEL"; out subject "$REF_NAME"
-            out dry "$IN_DRY"; out build_ref "$IN_REF"; out build_sha ""
+            out prerelease "$pre"; out dry "$IN_DRY"; out build_ref "$IN_REF"; out build_sha ""
             exit 0
           fi
 
           # ---- tag push ----
           tag="$REF_NAME"
           if [[ "$tag" != *-viallon* ]]; then
-            echo "::error::tag '$tag' must end in -viallon<N>[.<M>]"
+            echo "::error::tag '$tag' must end in -viallon<N>, -viallon<N>.<M> or -viallon<N><letters>"
             exit 1
           fi
           n="${tag##*-viallon}"
-          if [[ ! "$n" =~ ^[1-9][0-9]*(\.[1-9][0-9]*)?$ ]]; then
-            echo "::error::viallon counter must be N or N.M (N,M >= 1), got '$n' in '$tag'"
+          # Three grammars, on purpose:
+          #   N           a release of the base version            (v2.5.2-viallon13)
+          #   N.M         the drift rebuild's own tag              (skipped below)
+          #   N<letters>  a PRERELEASE: the fork resets the counter at every
+          #               rebase (viallon0a) and marks it with letters.
+          if [[ ! "$n" =~ ^[0-9]+(\.[0-9]+)?$ ]] \
+             && [[ ! "$n" =~ ^[0-9]+[a-z]+$ ]]; then
+            echo "::error::viallon counter must be N, N.M or N<letters> (e.g. 13, 12.1, 0a), got '$n' in '$tag'"
             exit 1
           fi
           base="${tag%-viallon*}"
           if   [[ "$base" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            ch=stable
+            base_ch=stable
           elif [[ "$base" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-.+$ ]]; then
-            ch=beta
+            base_ch=beta
           else
             echo "::error::unrecognised base version '$base' (from '$tag')"
             exit 1
+          fi
+          # A letter suffix means PRERELEASE, and a prerelease goes to the beta
+          # channel whatever the base version says: that is the only way a tester
+          # can pick it up without touching the stable branch.
+          if [[ "$n" =~ [a-z] ]]; then
+            pre=true; ch=beta
+          else
+            pre=false; ch="$base_ch"
           fi
 
           # An `N.M` tag is created by the drift rebuild itself, whose run has
@@ -205,7 +225,8 @@ jobs:
           # push-source-to-resources.yml carry the same guard).
           if [[ "$n" == *.* ]]; then
             echo "Tag \`$tag\` is an automatic rebuild tag; already built by the drift run. Nothing to do."
-            out rebuild false; out tag ""; out ostree "$ch"; out subject ""; out dry false
+            out rebuild false; out tag ""; out ostree "$ch"; out subject ""
+            out prerelease false; out dry false
             out build_ref "refs/heads/$DEFAULT_BRANCH"; out build_sha ""
             exit 0
           fi
@@ -219,11 +240,12 @@ jobs:
             echo "| base version | \`$base\` |"
             echo "| viallon release | \`$n\` |"
             echo "| channel | **$ch** |"
+            echo "| prerelease | **$pre** |"
             echo "| commit subject | \`${base#v}+viallon${n}\` |"
           } >> "$GITHUB_STEP_SUMMARY"
 
           out rebuild true; out tag ""; out ostree "$ch"; out subject "${base#v}+viallon${n}"
-          out dry false; out build_ref "$REF"; out build_sha "$SHA"
+          out prerelease "$pre"; out dry false; out build_ref "$REF"; out build_sha "$SHA"
 
   filegraph:
     name: Build filegraph extension
@@ -425,3 +447,54 @@ jobs:
           git add .github/flatpak-runtime-pins.json
           git diff --cached --quiet || git commit -m "chore(flatpak): pin runtime commits used by the last build"
           git push
+
+      # One GitHub release per pushed tag, created only AFTER the Flatpak was
+      # built and published, so a release page always means "there is a build".
+      # A letter-suffixed tag (viallon0a) is a PRERELEASE: it is published on the
+      # beta Flatpak branch and must never look like a stable release.
+      # Only a real TAG PUSH creates a release. `tag == ''` alone is NOT enough:
+      # it is also true for a manual dispatch, whose ref is a BRANCH name, and
+      # `gh release create` would then mint a bogus tag named after the branch.
+      # The drift rebuild's own automatic tag (tag != '') must not create a
+      # second release either.
+      - name: Create the GitHub release
+        if: |
+          needs.meta.outputs.tag == ''
+          && github.event_name == 'push'
+          && startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          SUBJECT: ${{ needs.meta.outputs.subject }}
+          OSTREE: ${{ needs.meta.outputs.ostree }}
+          PRERELEASE: ${{ needs.meta.outputs.prerelease }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "release $TAG already exists; nothing to do"
+            exit 0
+          fi
+          args=(--title "Amethyst Mod Manager ${SUBJECT}")
+          if [ "$PRERELEASE" = "true" ]; then
+            args+=(--prerelease)
+            kind="prerelease"
+          else
+            kind="release"
+          fi
+          {
+            echo "Fork build of ${SUBJECT%%+*} — published on the **${OSTREE}** Flatpak branch."
+            echo
+            echo '```bash'
+            echo "# first time only (the remote is unsigned: --no-gpg-verify if asked)"
+            echo "flatpak remote-add --user --if-not-exists amethyst-aviallon \\"
+            echo "  https://aviallon.github.io/hub-viallon/amethyst/amethyst.flatpakrepo"
+            echo "flatpak install --user amethyst-aviallon io.github.Amethyst.ModManager//${OSTREE}"
+            echo "# afterwards"
+            echo "flatpak update --user io.github.Amethyst.ModManager"
+            echo '```'
+          } > /tmp/release-notes.md
+          # Notes above are prepended to the notes GitHub generates from the
+          # commits since the previous release (gh documents exactly that).
+          gh release create "$TAG" --notes-file /tmp/release-notes.md \
+            --generate-notes "${args[@]}"
+          echo "created the $kind $TAG" | tee -a "$GITHUB_STEP_SUMMARY"
