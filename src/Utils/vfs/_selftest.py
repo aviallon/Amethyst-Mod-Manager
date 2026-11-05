@@ -52,7 +52,11 @@ from Utils.vfs import (  # noqa: E402
     virtual_root_write_path,
     wrap_command,
 )
-from Utils.vfs.overlay import _links_into_root, _move_materialized_tree  # noqa: E402
+from Utils.vfs.overlay import (  # noqa: E402
+    PROBE_COMMAND,
+    _links_into_root,
+    _move_materialized_tree,
+)
 from Utils.deployment import (  # noqa: E402
     CustomRule,
     LinkMode,
@@ -556,7 +560,7 @@ def test_nested_overlay() -> None:
         # Native overlayfs leaves a mode-000 internal work/ entry; a second
         # wrapper construction must clean/recreate it safely.
         repeat = subprocess.run(
-            wrap_command(game, ["/bin/true"]),
+            wrap_command(game, list(PROBE_COMMAND)),
             text=True, capture_output=True, check=False)
         assert repeat.returncode == 0, repeat.stderr
         assert (game.game / "root.txt").read_text() == "vanilla-root"
@@ -1363,7 +1367,7 @@ def test_symlinked_vfs_state_root_is_never_followed() -> None:
                 excluded_raw=None,
                 root_folder_enabled=False,
             ),
-            lambda: wrap_command(game, ["/bin/true"]),
+            lambda: wrap_command(game, list(PROBE_COMMAND)),
         ):
             (game.profiles / "filemap.txt").write_text("", encoding="utf-8")
             try:
@@ -5803,8 +5807,9 @@ def main() -> None:
     if selected:
         # Explicit selection (used by CI): run only the named checks. The full
         # suite needs native/runtime deps that may be absent (lz4, the
-        # filegraph native bits) and some checks assume /bin/true (missing on
-        # NixOS) - pre-existing failures unrelated to the selected checks.
+        # filegraph native bits) - pre-existing failures unrelated to the
+        # selected checks. (The /bin/true assumption is gone: the checks use
+        # PROBE_COMMAND, which exists on every host.)
         scope = globals()
         for name in selected:
             fn = scope.get(name)

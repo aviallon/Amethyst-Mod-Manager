@@ -372,12 +372,21 @@ def _bubblewrap_help() -> tuple[bool, str, str]:
     return True, "", help_text
 
 
+# Command used to probe namespace creation. It must exist on EVERY Linux host:
+# `/bin/true` does not on NixOS (its /bin carries only `sh`), and the probe is
+# deliberately run in the *host* context even from inside the Flatpak
+# (`flatpak-spawn --host`), so a /bin/true probe wrongly reports "Profile VFS is
+# unavailable" on such a host - native or Flatpak. `/bin/sh -c true` is portable
+# and exercises the same namespace creation and exec path.
+PROBE_COMMAND = ["/bin/sh", "-c", "true"]
+
+
 def _bubblewrap_namespace_status() -> tuple[bool, str]:
     """Check namespace creation in the same host context as VFS launches."""
     invocation = _bubblewrap_invocation()
     if not invocation:
         return False, "bubblewrap or Flatpak host spawning is unavailable"
-    args = ["--die-with-parent", "--dev-bind", "/", "/", "--", "/bin/true"]
+    args = ["--die-with-parent", "--dev-bind", "/", "/", "--", *PROBE_COMMAND]
     location = "Flatpak host" if _inside_flatpak() else "native/AppImage host"
     try:
         probe = subprocess.run(
@@ -1883,7 +1892,10 @@ def build_layers(
     def _probe_bind_launch() -> tuple[bool, str]:
         try:
             probe = subprocess.run(
-                wrap_command(game, ["/bin/true"]),
+                # Same portability rule as PROBE_COMMAND above: this probe runs
+                # INSIDE the launched namespace, so it must not assume /bin/true
+                # exists either.
+                wrap_command(game, list(PROBE_COMMAND)),
                 text=True,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
