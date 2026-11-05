@@ -6952,7 +6952,6 @@ class MainWindow(QMainWindow):
         import json as _json
         from Utils.mods.modlist import read_modlist
         from Utils.collections.diff import diff_collection
-        from Utils.profiles.state import read_collection_revision
         from Utils.collections.installed import primary_collection, plan_collection_removal, _read_record
         try:
             collection_record = (_read_record(Path(installation.record["path"]))
@@ -7129,7 +7128,6 @@ class MainWindow(QMainWindow):
         skipped_mods = list(info.get("skipped_mods") or [])
 
         from Utils.games.registry import _create_profile
-        from Utils.profiles.state import write_collection_optional_skipped
 
         # overwrite_existing is None for new/continue (fresh modlist write); a bool
         # for append (preserves existing load order via _append_reconcile_modlist).
