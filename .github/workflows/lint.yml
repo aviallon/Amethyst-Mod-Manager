@@ -71,9 +71,23 @@ jobs:
         env:
           PYTHONPATH: src
         run: |
+          set -euo pipefail
           python3 -m Utils.profiles._selftest
           python3 -m Nexus._bundled_meta_selftest
-          python3 -m Utils.filegraph._selftest
+          # Utils.filegraph._selftest SKIPS its group-farm staleness class when
+          # the cargo-built extension (src/amethyst_filegraph.abi3.so) or the
+          # app's runtime deps are absent; this job builds/installs neither
+          # (flatpak.yml builds the extension for the real artifact). A skip is
+          # not a check, so the skip is ASSERTED here: it must be the single,
+          # KNOWN one, otherwise the step fails. Silence would let that class
+          # and its siblings vanish without anyone noticing.
+          out=$(python3 -m Utils.filegraph._selftest -v 2>&1)
+          echo "$out"
+          if echo "$out" | grep -q 'skipped='; then
+            echo "$out" | grep -q "skipped 'native filegraph extension unavailable'" \
+              || { echo "::error::Utils.filegraph._selftest skipped for an unexpected reason"; exit 1; }
+            echo "::notice::filegraph native class skipped: native extension not built in this job"
+          fi
       - name: VFS mask self-tests (explicit selection)
         # The FULL Utils.vfs._selftest suite is not runnable here: beyond the
         # mask tests it needs native/runtime deps this job does not install
